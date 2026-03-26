@@ -74,7 +74,50 @@ class Transaction(Base):
     to_account = relationship("Account", foreign_keys=[to_account_id])
 
 
+class Category(Base):
+    __tablename__ = "categories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    type = Column(String, nullable=False)            # expense, income
+    color = Column(String, default="#94A3B8")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
+
+
+# ── Seed default categories ──────────────────────────────────────────────────
+def _seed_categories():
+    db = SessionLocal()
+    try:
+        if db.query(Category).count() == 0:
+            defaults = [
+                ("Cibo", "expense", "#EF4444"),
+                ("Trasporti", "expense", "#3B82F6"),
+                ("Casa", "expense", "#F59E0B"),
+                ("Abbigliamento", "expense", "#EC4899"),
+                ("Svago", "expense", "#8B5CF6"),
+                ("Salute", "expense", "#10B981"),
+                ("Bollette", "expense", "#F97316"),
+                ("Spesa", "expense", "#14B8A6"),
+                ("Ristorante", "expense", "#E11D48"),
+                ("Regali", "expense", "#A855F7"),
+                ("Altro", "expense", "#94A3B8"),
+                ("Stipendio", "income", "#10B981"),
+                ("Freelance", "income", "#6366F1"),
+                ("Regalo", "income", "#EC4899"),
+                ("Rimborso", "income", "#06B6D4"),
+                ("Investimenti", "income", "#84CC16"),
+                ("Altro", "income", "#94A3B8"),
+            ]
+            for name, ctype, color in defaults:
+                db.add(Category(name=name, type=ctype, color=color))
+            db.commit()
+    finally:
+        db.close()
+
+_seed_categories()
 
 app = FastAPI(title="TimeShift API")
 
@@ -172,6 +215,30 @@ class AccountOut(BaseModel):
     icon: str
     color: str
     initial_balance: float
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ── Category schemas ────────────────────────────────────────────────────────
+
+class CategoryCreate(BaseModel):
+    name: str
+    type: str                        # expense, income
+    color: str = "#94A3B8"
+
+
+class CategoryUpdate(BaseModel):
+    name: Optional[str] = None
+    type: Optional[str] = None
+    color: Optional[str] = None
+
+
+class CategoryOut(BaseModel):
+    id: int
+    name: str
+    type: str
+    color: str
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -360,6 +427,47 @@ def delete_account(account_id: int, db: Session = Depends(get_db)):
     db.commit()
 
 
+# ── Category endpoints ───────────────────────────────────────────────────────
+
+@app.get("/categories", response_model=List[CategoryOut])
+def list_categories(db: Session = Depends(get_db)):
+    return db.query(Category).order_by(Category.type, Category.name).all()
+
+
+@app.post("/categories", response_model=CategoryOut, status_code=201)
+def create_category(data: CategoryCreate, db: Session = Depends(get_db)):
+    if data.type not in ("expense", "income"):
+        raise HTTPException(status_code=422, detail="Tipo deve essere: expense, income")
+    cat = Category(**data.model_dump())
+    db.add(cat)
+    db.commit()
+    db.refresh(cat)
+    return cat
+
+
+@app.put("/categories/{cat_id}", response_model=CategoryOut)
+def update_category(cat_id: int, data: CategoryUpdate, db: Session = Depends(get_db)):
+    cat = db.query(Category).filter(Category.id == cat_id).first()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Categoria non trovata")
+    if data.type and data.type not in ("expense", "income"):
+        raise HTTPException(status_code=422, detail="Tipo deve essere: expense, income")
+    for k, v in data.model_dump(exclude_unset=True).items():
+        setattr(cat, k, v)
+    db.commit()
+    db.refresh(cat)
+    return cat
+
+
+@app.delete("/categories/{cat_id}", status_code=204)
+def delete_category(cat_id: int, db: Session = Depends(get_db)):
+    cat = db.query(Category).filter(Category.id == cat_id).first()
+    if not cat:
+        raise HTTPException(status_code=404, detail="Categoria non trovata")
+    db.delete(cat)
+    db.commit()
+
+
 # ── Transaction endpoints ────────────────────────────────────────────────────
 
 @app.get("/transactions", response_model=List[TransactionOut])
@@ -497,18 +605,16 @@ def get_finance_stats(db: Session = Depends(get_db)):
 def get_ai_context(db: Session = Depends(get_db)):
     """Returns everything an AI operator needs to build valid transaction JSON."""
     accs = db.query(Account).order_by(Account.id).all()
+    cats = db.query(Category).all()
+    expense_cats = [c.name for c in cats if c.type == "expense"]
+    income_cats = [c.name for c in cats if c.type == "income"]
     return {
         "accounts": [
             {"id": a.id, "name": a.name}
             for a in accs
         ],
-        "expense_categories": [
-            "Cibo", "Trasporti", "Casa", "Abbigliamento", "Svago",
-            "Salute", "Bollette", "Spesa", "Ristorante", "Regali", "Altro",
-        ],
-        "income_categories": [
-            "Stipendio", "Freelance", "Regalo", "Rimborso", "Investimenti", "Altro",
-        ],
+        "expense_categories": expense_cats,
+        "income_categories": income_cats,
         "transaction_schema": {
             "description": "Array di oggetti transazione da inviare via POST a /api/transactions/bulk",
             "items": {
@@ -706,13 +812,24 @@ def export_data(db: Session = Depends(get_db)):
             "created_at": t.created_at.isoformat() if t.created_at else None,
         })
 
+    categories_data = []
+    for cat in db.query(Category).order_by(Category.id).all():
+        categories_data.append({
+            "id": cat.id,
+            "name": cat.name,
+            "type": cat.type,
+            "color": cat.color,
+            "created_at": cat.created_at.isoformat() if cat.created_at else None,
+        })
+
     return {
-        "version": 2,
+        "version": 3,
         "exported_at": datetime.utcnow().isoformat(),
         "clients": clients_data,
         "sessions": sessions_data,
         "accounts": accounts_data,
         "transactions": transactions_data,
+        "categories": categories_data,
     }
 
 
@@ -722,6 +839,7 @@ class ImportPayload(BaseModel):
     sessions: List[dict]
     accounts: List[dict] = []
     transactions: List[dict] = []
+    categories: List[dict] = []
 
 
 @app.post("/import")
@@ -731,6 +849,7 @@ def import_data(payload: ImportPayload, db: Session = Depends(get_db)):
     db.query(Account).delete()
     db.query(WorkSession).delete()
     db.query(Client).delete()
+    db.query(Category).delete()
     db.commit()
 
     # Map old client IDs to new ones
@@ -808,10 +927,33 @@ def import_data(payload: ImportPayload, db: Session = Depends(get_db)):
                 pass
         db.add(tx)
 
+    # Import categories (or re-seed defaults if none provided)
+    imported_cats = 0
+    if payload.categories:
+        for cat_data in payload.categories:
+            cat = Category(
+                name=cat_data["name"],
+                type=cat_data["type"],
+                color=cat_data.get("color", "#94A3B8"),
+            )
+            if cat_data.get("created_at"):
+                try:
+                    cat.created_at = datetime.fromisoformat(cat_data["created_at"])
+                except (ValueError, TypeError):
+                    pass
+            db.add(cat)
+            imported_cats += 1
+
     db.commit()
+
+    # If no categories were imported, re-seed defaults
+    if imported_cats == 0:
+        _seed_categories()
+
     return {
         "imported_clients": len(id_map),
         "imported_sessions": len(payload.sessions),
         "imported_accounts": len(acc_map),
         "imported_transactions": len(payload.transactions),
+        "imported_categories": imported_cats,
     }
