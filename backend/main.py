@@ -605,91 +605,130 @@ def get_finance_stats(db: Session = Depends(get_db)):
 def get_ai_context(db: Session = Depends(get_db)):
     """Returns everything an AI operator needs to build valid transaction JSON."""
     accs = db.query(Account).order_by(Account.id).all()
-    cats = db.query(Category).all()
-    expense_cats = [c.name for c in cats if c.type == "expense"]
-    income_cats = [c.name for c in cats if c.type == "income"]
+    cats = db.query(Category).order_by(Category.type, Category.name).all()
+
+    accounts_list = [
+        {"id": a.id, "name": a.name, "icon": a.icon}
+        for a in accs
+    ]
+    expense_cats = [
+        {"id": c.id, "name": c.name}
+        for c in cats if c.type == "expense"
+    ]
+    income_cats = [
+        {"id": c.id, "name": c.name}
+        for c in cats if c.type == "income"
+    ]
+
+    # Build system prompt for the AI
+    acc_lines = ", ".join(f'id={a["id"]} "{a["name"]}" {a["icon"]}' for a in accounts_list)
+    exp_lines = ", ".join(f'"{c["name"]}" (id={c["id"]})' for c in expense_cats)
+    inc_lines = ", ".join(f'"{c["name"]}" (id={c["id"]})' for c in income_cats)
+
+    system_prompt = f"""Sei un assistente finanziario. Dato un testo in linguaggio naturale che descrive movimenti economici, devi generare un JSON valido per inserirli nell'app TimeShift.
+
+CONTI DISPONIBILI: {acc_lines}
+CATEGORIE SPESE: {exp_lines}
+CATEGORIE ENTRATE: {inc_lines}
+
+REGOLE:
+- type: "expense" per uscite, "income" per entrate, "transfer" per trasferimenti tra conti
+- amount: sempre positivo (es. 12.50)
+- date: formato YYYY-MM-DD. Se non specificata, usa la data di oggi
+- account_id: ID del conto. Se non specificato, usa il primo conto disponibile (id={accs[0].id if accs else 1})
+- category: DEVE essere esattamente uno dei nomi categoria elencati sopra (corrispondente al type). Per transfer lascia stringa vuota ""
+- to_account_id: obbligatorio solo per type=transfer, ID del conto destinazione
+- description: breve descrizione del movimento
+
+Rispondi SOLO con il JSON, nessun testo aggiuntivo. Il formato deve essere:
+{{"transactions": [...]}}"""
+
     return {
-        "accounts": [
-            {"id": a.id, "name": a.name}
-            for a in accs
-        ],
-        "expense_categories": expense_cats,
-        "income_categories": income_cats,
+        "system_prompt": system_prompt,
+        "accounts": accounts_list,
+        "categories": {
+            "expense": expense_cats,
+            "income": income_cats,
+        },
         "transaction_schema": {
-            "description": "Array di oggetti transazione da inviare via POST a /api/transactions/bulk",
-            "items": {
-                "type": {
-                    "type": "string",
-                    "enum": ["expense", "income", "transfer"],
-                    "required": True,
-                },
-                "amount": {
-                    "type": "number",
-                    "description": "Importo positivo in euro (es. 12.50)",
-                    "required": True,
-                },
-                "date": {
-                    "type": "string",
-                    "format": "YYYY-MM-DD",
-                    "description": "Data del movimento (es. 2026-03-21)",
-                    "required": True,
-                },
-                "account_id": {
-                    "type": "integer",
-                    "description": "ID del conto (vedi lista accounts)",
-                    "required": True,
-                },
-                "to_account_id": {
-                    "type": "integer | null",
-                    "description": "Solo per type=transfer: ID del conto di destinazione",
-                    "required": False,
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Categoria (vedi expense_categories o income_categories). Vuoto per transfer.",
-                    "required": False,
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Descrizione libera del movimento",
-                    "required": False,
+            "type": "object",
+            "required": ["transactions"],
+            "properties": {
+                "transactions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["type", "amount", "date", "account_id"],
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["expense", "income", "transfer"],
+                            },
+                            "amount": {
+                                "type": "number",
+                                "description": "Importo positivo in euro",
+                            },
+                            "date": {
+                                "type": "string",
+                                "format": "date",
+                                "description": "YYYY-MM-DD",
+                            },
+                            "account_id": {
+                                "type": "integer",
+                                "description": "ID del conto",
+                            },
+                            "to_account_id": {
+                                "type": "integer",
+                                "nullable": True,
+                                "description": "Solo per transfer: ID conto destinazione",
+                            },
+                            "category": {
+                                "type": "string",
+                                "description": "Nome categoria (da categories.expense o categories.income)",
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Descrizione del movimento",
+                            },
+                        },
+                    },
                 },
             },
         },
-        "example": [
-            {
-                "type": "expense",
-                "amount": 45.00,
-                "date": "2026-03-21",
-                "account_id": accs[0].id if accs else 1,
-                "category": "Spesa",
-                "description": "Spesa settimanale al supermercato",
-            },
-            {
-                "type": "income",
-                "amount": 1500.00,
-                "date": "2026-03-01",
-                "account_id": accs[0].id if accs else 1,
-                "category": "Stipendio",
-                "description": "Stipendio Marzo",
-            },
-            {
-                "type": "transfer",
-                "amount": 200.00,
-                "date": "2026-03-15",
-                "account_id": accs[0].id if accs else 1,
-                "to_account_id": accs[1].id if len(accs) > 1 else 2,
-                "category": "",
-                "description": "Ricarica contanti",
-            },
-        ],
+        "example_input": "Ho speso 45 euro al supermercato ieri e 12.50 per il pranzo. Stamattina ho ricevuto lo stipendio di 1500 euro.",
+        "example_output": {
+            "transactions": [
+                {
+                    "type": "expense",
+                    "amount": 45.00,
+                    "date": "2026-03-29",
+                    "account_id": accs[0].id if accs else 1,
+                    "category": "Spesa",
+                    "description": "Spesa al supermercato",
+                },
+                {
+                    "type": "expense",
+                    "amount": 12.50,
+                    "date": "2026-03-30",
+                    "account_id": accs[0].id if accs else 1,
+                    "category": "Ristorante",
+                    "description": "Pranzo",
+                },
+                {
+                    "type": "income",
+                    "amount": 1500.00,
+                    "date": "2026-03-30",
+                    "account_id": accs[0].id if accs else 1,
+                    "category": "Stipendio",
+                    "description": "Stipendio",
+                },
+            ],
+        },
         "bulk_endpoint": {
             "method": "POST",
             "path": "/api/transactions/bulk",
-            "body": {
-                "transactions": "[ ...array di oggetti come da schema sopra... ]"
-            },
-            "description": "Invia un array di transazioni. Restituisce il conteggio degli inserimenti.",
+            "content_type": "application/json",
+            "description": "Invia il JSON generato dall'AI direttamente a questo endpoint.",
         },
     }
 
