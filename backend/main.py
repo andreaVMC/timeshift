@@ -1,12 +1,23 @@
 import os
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+import bcrypt as _bcrypt
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey
+
+
+def hash_password(password: str) -> str:
+    return _bcrypt.hashpw(password.encode(), _bcrypt.gensalt()).decode()
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return _bcrypt.checkpw(password.encode(), hashed.encode())
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship, Session
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./timeshift.db")
@@ -84,6 +95,27 @@ class Category(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AuthToken(Base):
+    __tablename__ = "auth_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String, unique=True, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    last_used_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -119,6 +151,37 @@ def _seed_categories():
 
 _seed_categories()
 
+
+# ── Seed default admin user ─────────────────────────────────────────────────
+def _seed_admin():
+    db = SessionLocal()
+    try:
+        if db.query(User).count() == 0:
+            admin = User(
+                username="admin",
+                hashed_password=hash_password("admin"),
+            )
+            db.add(admin)
+            db.commit()
+    finally:
+        db.close()
+
+_seed_admin()
+
+
+# ── Cleanup stale tokens (inactive > 30 days) ──────────────────────────────
+def _cleanup_tokens():
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=30)
+        db.query(AuthToken).filter(AuthToken.last_used_at < cutoff).delete()
+        db.commit()
+    finally:
+        db.close()
+
+_cleanup_tokens()
+
+
 app = FastAPI(title="TimeShift API")
 
 app.add_middleware(
@@ -136,6 +199,99 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# ── Auth ─────────────────────────────────────────────────────────────────────
+
+security = HTTPBearer()
+
+TOKEN_INACTIVITY_DAYS = 30
+
+
+def get_current_user(
+    creds: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+) -> User:
+    token_row = db.query(AuthToken).filter(AuthToken.token == creds.credentials).first()
+    if not token_row:
+        raise HTTPException(status_code=401, detail="Token non valido")
+    # Check inactivity
+    if token_row.last_used_at < datetime.utcnow() - timedelta(days=TOKEN_INACTIVITY_DAYS):
+        db.delete(token_row)
+        db.commit()
+        raise HTTPException(status_code=401, detail="Token scaduto per inattività")
+    # Update last_used_at
+    token_row.last_used_at = datetime.utcnow()
+    db.commit()
+    return token_row.user
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/login")
+def login(data: LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == data.username).first()
+    if not user or not verify_password(data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Credenziali non valide")
+    token = secrets.token_urlsafe(48)
+    auth_token = AuthToken(token=token, user_id=user.id)
+    db.add(auth_token)
+    db.commit()
+    return {"token": token, "username": user.username}
+
+
+@app.post("/auth/logout")
+def logout(
+    creds: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db),
+):
+    token_row = db.query(AuthToken).filter(AuthToken.token == creds.credentials).first()
+    if token_row:
+        db.delete(token_row)
+        db.commit()
+    return {"ok": True}
+
+
+@app.put("/auth/change-password")
+def change_password(
+    data: dict,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    old_pw = data.get("old_password", "")
+    new_pw = data.get("new_password", "")
+    if not new_pw or len(new_pw) < 4:
+        raise HTTPException(status_code=422, detail="La nuova password deve avere almeno 4 caratteri")
+    if not verify_password(old_pw, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Password attuale non corretta")
+    user.hashed_password = hash_password(new_pw)
+    db.commit()
+    return {"ok": True}
+
+
+@app.put("/auth/change-username")
+def change_username(
+    data: dict,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    new_username = (data.get("new_username") or "").strip()
+    if not new_username or len(new_username) < 3:
+        raise HTTPException(status_code=422, detail="Lo username deve avere almeno 3 caratteri")
+    existing = db.query(User).filter(User.username == new_username, User.id != user.id).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Username già in uso")
+    user.username = new_username
+    db.commit()
+    return {"ok": True, "username": new_username}
+
+
+@app.get("/auth/me")
+def get_me(user: User = Depends(get_current_user)):
+    return {"username": user.username}
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
@@ -296,12 +452,12 @@ def _compute_hours(start: str, end: str) -> float:
 # ── Client endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/clients", response_model=List[ClientOut])
-def list_clients(db: Session = Depends(get_db)):
+def list_clients(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return db.query(Client).order_by(Client.created_at).all()
 
 
 @app.post("/clients", response_model=ClientOut, status_code=201)
-def create_client(data: ClientCreate, db: Session = Depends(get_db)):
+def create_client(data: ClientCreate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     client = Client(**data.model_dump())
     db.add(client)
     db.commit()
@@ -310,7 +466,7 @@ def create_client(data: ClientCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/clients/{client_id}", response_model=ClientOut)
-def update_client(client_id: int, data: ClientUpdate, db: Session = Depends(get_db)):
+def update_client(client_id: int, data: ClientUpdate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Cliente non trovato")
@@ -322,7 +478,7 @@ def update_client(client_id: int, data: ClientUpdate, db: Session = Depends(get_
 
 
 @app.delete("/clients/{client_id}", status_code=204)
-def delete_client(client_id: int, db: Session = Depends(get_db)):
+def delete_client(client_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Cliente non trovato")
@@ -333,12 +489,12 @@ def delete_client(client_id: int, db: Session = Depends(get_db)):
 # ── Session endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/sessions", response_model=List[WorkSessionOut])
-def list_sessions(db: Session = Depends(get_db)):
+def list_sessions(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return db.query(WorkSession).order_by(WorkSession.date.desc(), WorkSession.id.desc()).all()
 
 
 @app.post("/sessions", response_model=WorkSessionOut, status_code=201)
-def create_session(data: WorkSessionCreate, db: Session = Depends(get_db)):
+def create_session(data: WorkSessionCreate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     hours = data.hours
     if hours is None:
         if data.start_time and data.end_time:
@@ -355,7 +511,7 @@ def create_session(data: WorkSessionCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/sessions/{session_id}", response_model=WorkSessionOut)
-def update_session(session_id: int, data: WorkSessionUpdate, db: Session = Depends(get_db)):
+def update_session(session_id: int, data: WorkSessionUpdate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     session = db.query(WorkSession).filter(WorkSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Sessione non trovata")
@@ -374,7 +530,7 @@ def update_session(session_id: int, data: WorkSessionUpdate, db: Session = Depen
 
 
 @app.delete("/sessions/{session_id}", status_code=204)
-def delete_session(session_id: int, db: Session = Depends(get_db)):
+def delete_session(session_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     session = db.query(WorkSession).filter(WorkSession.id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Sessione non trovata")
@@ -385,12 +541,12 @@ def delete_session(session_id: int, db: Session = Depends(get_db)):
 # ── Account endpoints ────────────────────────────────────────────────────────
 
 @app.get("/accounts", response_model=List[AccountOut])
-def list_accounts(db: Session = Depends(get_db)):
+def list_accounts(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return db.query(Account).order_by(Account.created_at).all()
 
 
 @app.post("/accounts", response_model=AccountOut, status_code=201)
-def create_account(data: AccountCreate, db: Session = Depends(get_db)):
+def create_account(data: AccountCreate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     account = Account(**data.model_dump())
     db.add(account)
     db.commit()
@@ -399,7 +555,7 @@ def create_account(data: AccountCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/accounts/{account_id}", response_model=AccountOut)
-def update_account(account_id: int, data: AccountUpdate, db: Session = Depends(get_db)):
+def update_account(account_id: int, data: AccountUpdate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Conto non trovato")
@@ -411,7 +567,7 @@ def update_account(account_id: int, data: AccountUpdate, db: Session = Depends(g
 
 
 @app.delete("/accounts/{account_id}", status_code=204)
-def delete_account(account_id: int, db: Session = Depends(get_db)):
+def delete_account(account_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Conto non trovato")
@@ -430,12 +586,12 @@ def delete_account(account_id: int, db: Session = Depends(get_db)):
 # ── Category endpoints ───────────────────────────────────────────────────────
 
 @app.get("/categories", response_model=List[CategoryOut])
-def list_categories(db: Session = Depends(get_db)):
+def list_categories(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return db.query(Category).order_by(Category.type, Category.name).all()
 
 
 @app.post("/categories", response_model=CategoryOut, status_code=201)
-def create_category(data: CategoryCreate, db: Session = Depends(get_db)):
+def create_category(data: CategoryCreate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     if data.type not in ("expense", "income"):
         raise HTTPException(status_code=422, detail="Tipo deve essere: expense, income")
     cat = Category(**data.model_dump())
@@ -446,7 +602,7 @@ def create_category(data: CategoryCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/categories/{cat_id}", response_model=CategoryOut)
-def update_category(cat_id: int, data: CategoryUpdate, db: Session = Depends(get_db)):
+def update_category(cat_id: int, data: CategoryUpdate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     cat = db.query(Category).filter(Category.id == cat_id).first()
     if not cat:
         raise HTTPException(status_code=404, detail="Categoria non trovata")
@@ -460,7 +616,7 @@ def update_category(cat_id: int, data: CategoryUpdate, db: Session = Depends(get
 
 
 @app.delete("/categories/{cat_id}", status_code=204)
-def delete_category(cat_id: int, db: Session = Depends(get_db)):
+def delete_category(cat_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     cat = db.query(Category).filter(Category.id == cat_id).first()
     if not cat:
         raise HTTPException(status_code=404, detail="Categoria non trovata")
@@ -471,12 +627,12 @@ def delete_category(cat_id: int, db: Session = Depends(get_db)):
 # ── Transaction endpoints ────────────────────────────────────────────────────
 
 @app.get("/transactions", response_model=List[TransactionOut])
-def list_transactions(db: Session = Depends(get_db)):
+def list_transactions(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return db.query(Transaction).order_by(Transaction.date.desc(), Transaction.id.desc()).all()
 
 
 @app.post("/transactions", response_model=TransactionOut, status_code=201)
-def create_transaction(data: TransactionCreate, db: Session = Depends(get_db)):
+def create_transaction(data: TransactionCreate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     if data.type not in ("expense", "income", "transfer"):
         raise HTTPException(status_code=422, detail="Tipo deve essere: expense, income, transfer")
     if data.type == "transfer" and not data.to_account_id:
@@ -491,7 +647,7 @@ def create_transaction(data: TransactionCreate, db: Session = Depends(get_db)):
 
 
 @app.put("/transactions/{tx_id}", response_model=TransactionOut)
-def update_transaction(tx_id: int, data: TransactionUpdate, db: Session = Depends(get_db)):
+def update_transaction(tx_id: int, data: TransactionUpdate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Movimento non trovato")
@@ -503,7 +659,7 @@ def update_transaction(tx_id: int, data: TransactionUpdate, db: Session = Depend
 
 
 @app.delete("/transactions/{tx_id}", status_code=204)
-def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
+def delete_transaction(tx_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Movimento non trovato")
@@ -514,7 +670,7 @@ def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
 # ── Finance stats endpoint ───────────────────────────────────────────────────
 
 @app.get("/finance-stats")
-def get_finance_stats(db: Session = Depends(get_db)):
+def get_finance_stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     accounts = db.query(Account).all()
     transactions = db.query(Transaction).all()
 
@@ -602,7 +758,7 @@ def get_finance_stats(db: Session = Depends(get_db)):
 # ── AI operator context endpoint ─────────────────────────────────────────────
 
 @app.get("/ai-context")
-def get_ai_context(db: Session = Depends(get_db)):
+def get_ai_context(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     """Returns everything an AI operator needs to build valid transaction JSON."""
     accs = db.query(Account).order_by(Account.id).all()
     cats = db.query(Category).order_by(Category.type, Category.name).all()
@@ -740,7 +896,7 @@ class BulkTransactionsPayload(BaseModel):
 
 
 @app.post("/transactions/bulk")
-def bulk_create_transactions(payload: BulkTransactionsPayload, db: Session = Depends(get_db)):
+def bulk_create_transactions(payload: BulkTransactionsPayload, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     created = 0
     errors = []
     for i, data in enumerate(payload.transactions):
@@ -772,7 +928,7 @@ def bulk_create_transactions(payload: BulkTransactionsPayload, db: Session = Dep
 # ── Stats endpoint ────────────────────────────────────────────────────────────
 
 @app.get("/stats")
-def get_stats(db: Session = Depends(get_db)):
+def get_stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     clients = db.query(Client).all()
     by_client = []
     total_hours = 0.0
@@ -802,7 +958,7 @@ def get_stats(db: Session = Depends(get_db)):
 # ── Export / Import ──────────────────────────────────────────────────────────
 
 @app.get("/export")
-def export_data(db: Session = Depends(get_db)):
+def export_data(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     clients_data = []
     for c in db.query(Client).order_by(Client.id).all():
         clients_data.append({
@@ -882,7 +1038,7 @@ class ImportPayload(BaseModel):
 
 
 @app.post("/import")
-def import_data(payload: ImportPayload, db: Session = Depends(get_db)):
+def import_data(payload: ImportPayload, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     # Clear existing data (children first due to FK)
     db.query(Transaction).delete()
     db.query(Account).delete()
