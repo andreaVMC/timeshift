@@ -1,4 +1,5 @@
 version: '3.8'
+
 services:
   backend:
     build: ./backend
@@ -9,8 +10,9 @@ services:
       - 'DATABASE_URL=sqlite:////app/data/timeshift.db'
     networks:
       - timeshift-net
-      - coolify
+      - coolify_internal
     restart: unless-stopped
+
   frontend:
     build: ./frontend
     depends_on:
@@ -22,5 +24,6 @@ services:
 networks:
   timeshift-net:
     driver: bridge
-  coolify:
+  coolify_internal:
     external: true
+    name: coolify
