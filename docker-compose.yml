@@ -1,5 +1,4 @@
 version: '3.8'
-
 services:
   backend:
     build: ./backend
@@ -10,9 +9,8 @@ services:
       - 'DATABASE_URL=sqlite:////app/data/timeshift.db'
     networks:
       - timeshift-net
-      - coolify # Permette a n8n di "vedere" il backend
+      - coolify
     restart: unless-stopped
-
   frontend:
     build: ./frontend
     depends_on:
@@ -22,9 +20,7 @@ services:
     restart: unless-stopped
 
 networks:
-  # Rete interna privata per la comunicazione backend <-> frontend
   timeshift-net:
     driver: bridge
-  # Rete condivisa di Coolify per la comunicazione n8n <-> backend
   coolify:
     external: true
