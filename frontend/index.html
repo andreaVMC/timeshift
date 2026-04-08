@@ -180,6 +180,11 @@ let finStats = null;
 let calDate  = new Date();
 let view     = 'dashboard';
 let charts   = {};
+// Filtri (persistono nella sessione)
+let dashboardMonth = '';        // '' = tutti i tempi, 'YYYY-MM' = mese specifico
+let includePendingInTotal = true; // se true, "Guadagno Totale" include lavoro non ancora pagato
+let sessionsMonth = '';
+let transactionsMonth = '';
 
 // ─── Finance categories (dynamic from API) ──────────────────────────────────
 let categoriesData = [];
@@ -411,16 +416,82 @@ function navigate(v) {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
+// Helper: array di mesi (YYYY-MM) presenti in sessions o transactions
+function availableMonths() {
+  const set = new Set();
+  sessions.forEach(s => set.add(s.date.slice(0,7)));
+  transactions.forEach(t => set.add(t.date.slice(0,7)));
+  return Array.from(set).sort().reverse();
+}
+
+function monthLabel(ym) {
+  if (!ym) return 'Tutti i periodi';
+  const [y,m] = ym.split('-');
+  return `${MONTHS_IT[parseInt(m)-1]} ${y}`;
+}
+
+// Per-client period + global aggregates
+function clientAggregates(month = '') {
+  return clients.map(c => {
+    const periodSessions = month
+      ? sessions.filter(s => s.client_id === c.id && s.date.startsWith(month))
+      : sessions.filter(s => s.client_id === c.id);
+    const periodPayments = month
+      ? transactions.filter(t => t.type === 'income' && t.client_id === c.id && t.date.startsWith(month))
+      : transactions.filter(t => t.type === 'income' && t.client_id === c.id);
+    const periodHours    = periodSessions.reduce((a,s) => a + s.hours, 0);
+    const periodEarned   = periodHours * c.hourly_rate;
+    const periodPaid     = periodPayments.reduce((a,t) => a + t.amount, 0);
+
+    const allSessions    = sessions.filter(s => s.client_id === c.id);
+    const allPayments    = transactions.filter(t => t.type === 'income' && t.client_id === c.id);
+    const globalEarned   = allSessions.reduce((a,s) => a + s.hours, 0) * c.hourly_rate;
+    const globalPaid     = allPayments.reduce((a,t) => a + t.amount, 0);
+    const pending        = globalEarned - globalPaid;
+
+    return {
+      id: c.id, name: c.name, color: c.color, hourly_rate: c.hourly_rate, account_id: c.account_id,
+      periodHours, periodEarned, periodPaid, globalEarned, globalPaid, pending,
+    };
+  });
+}
+
+function setDashboardMonth(v) {
+  dashboardMonth = v;
+  renderDashboard(document.getElementById('content'));
+}
+
+function toggleIncludePending() {
+  includePendingInTotal = !includePendingInTotal;
+  renderDashboard(document.getElementById('content'));
+}
+
 function renderDashboard(el) {
   const now  = new Date();
-  const ymNow = ym(now);
-  const monthSessions = sessions.filter(s => s.date.startsWith(ymNow));
-  const monthEarnings = monthSessions.reduce((a,s) => {
+  const month = dashboardMonth; // '' = all-time
+  const filteredSessions = month ? sessions.filter(s => s.date.startsWith(month)) : sessions;
+  const filteredTxs      = month ? transactions.filter(t => t.date.startsWith(month)) : transactions;
+
+  const periodHours = filteredSessions.reduce((a,s) => a + s.hours, 0);
+  const periodEarned = filteredSessions.reduce((a,s) => {
     const c = clientById(s.client_id);
     return a + (c ? s.hours * c.hourly_rate : 0);
   }, 0);
+  const periodPaid = filteredTxs
+    .filter(t => t.type === 'income' && t.client_id)
+    .reduce((a,t) => a + t.amount, 0);
 
-  // Monthly data (last 6 months)
+  const byClient = clientAggregates(month);
+  const globalPending = byClient.reduce((a,c) => a + c.pending, 0);
+  const pendingClients = byClient
+    .filter(c => c.pending > 0.005)
+    .sort((a,b) => b.pending - a.pending);
+
+  // Toggle: incluso pendente => mostra il "guadagnato" (lavorato), altrimenti solo "incassato"
+  const earningsKpiValue = includePendingInTotal ? periodEarned : periodPaid;
+  const earningsKpiLabel = includePendingInTotal ? 'Guadagno Totale' : 'Incassato';
+
+  // Monthly bars: ultimi 6 mesi (sempre, indipendente dal filtro)
   const monthly = Array.from({length:6},(_,i) => {
     const d = new Date(now.getFullYear(), now.getMonth()-5+i, 1);
     const m = ym(d);
@@ -432,25 +503,39 @@ function renderDashboard(el) {
     return { label: MONTHS_IT[d.getMonth()].slice(0,3), value: Math.round(earn*100)/100 };
   });
 
-  const recent = [...sessions].slice(0,8);
+  const recent = [...filteredSessions].slice(0,8);
+  const months = availableMonths();
 
   el.innerHTML = `
-    <div class="mb-8">
-      <h2 class="text-2xl font-bold text-slate-800">Dashboard</h2>
-      <p class="text-slate-500 mt-1">${MONTHS_IT[now.getMonth()]} ${now.getFullYear()}</p>
+    <div class="mb-7 flex items-start justify-between flex-wrap gap-3">
+      <div>
+        <h2 class="text-2xl font-bold text-slate-800">Dashboard</h2>
+        <p class="text-slate-500 mt-1 text-sm">${monthLabel(month)}</p>
+      </div>
+      <div class="flex items-center gap-2 flex-wrap">
+        <select onchange="setDashboardMonth(this.value)"
+          class="px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          <option value="" ${month===''?'selected':''}>Tutti i periodi</option>
+          ${months.map(m => `<option value="${m}" ${m===month?'selected':''}>${monthLabel(m)}</option>`).join('')}
+        </select>
+        <button onclick="toggleIncludePending()" title="Includi/escludi i crediti pendenti dal totale guadagnato"
+          class="px-3 py-2 rounded-xl border text-sm font-medium transition-colors ${includePendingInTotal?'bg-indigo-50 border-indigo-200 text-indigo-700':'bg-white border-slate-200 text-slate-500'}">
+          ${includePendingInTotal ? '✓ Includi pendenti' : 'Solo incassato'}
+        </button>
+      </div>
     </div>
 
     <div class="grid grid-cols-2 xl:grid-cols-4 gap-5 mb-8">
-      ${kpi('Ore Totali',  fmtHours(stats?.total_hours||0),  'text-blue-600',   'bg-blue-50',   'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z')}
-      ${kpi('Guadagno Totale', euro(stats?.total_earnings||0), 'text-emerald-600','bg-emerald-50','M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z')}
-      ${kpi('Clienti',     clients.length,                    'text-violet-600', 'bg-violet-50', 'M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z')}
-      ${kpi('Questo Mese', euro(monthEarnings),               'text-amber-600',  'bg-amber-50',  'M13 7h8m0 0v8m0-8l-8 8-4-4-6 6')}
+      ${kpi('Ore (periodo)',  fmtHours(periodHours),  'text-blue-600',   'bg-blue-50',   'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z')}
+      ${kpi(earningsKpiLabel, euro(earningsKpiValue), 'text-emerald-600','bg-emerald-50','M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z')}
+      ${kpi('Pagato (periodo)', euro(periodPaid),     'text-indigo-600', 'bg-indigo-50', 'M5 13l4 4L19 7')}
+      ${kpi('Da Riscuotere',    euro(globalPending),  globalPending>0.005?'text-amber-600':'text-slate-400', globalPending>0.005?'bg-amber-50':'bg-slate-50', 'M12 8v4m0 4h.01M12 2a10 10 0 100 20 10 10 0 000-20z')}
     </div>
 
     <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
       <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6">
         <h3 class="font-semibold text-slate-700 mb-5">Guadagni per Cliente</h3>
-        ${stats?.by_client?.length
+        ${byClient.some(c => c.periodEarned > 0)
           ? `<div class="flex justify-center"><canvas id="ch-pie" width="260" height="260"></canvas></div>`
           : `<div class="h-44 flex items-center justify-center text-slate-400 text-sm">Nessun dato</div>`}
       </div>
@@ -460,36 +545,73 @@ function renderDashboard(el) {
       </div>
     </div>
 
-    ${stats?.by_client?.length ? `
+    ${pendingClients.length ? `
     <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6 mb-6">
-      <h3 class="font-semibold text-slate-700 mb-5">Riepilogo per Cliente</h3>
+      <div class="flex items-center justify-between mb-5">
+        <h3 class="font-semibold text-slate-700 flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+          Crediti Pendenti
+        </h3>
+        <span class="text-sm text-slate-400">${pendingClients.length} client${pendingClients.length!==1?'i':'e'} con saldo aperto</span>
+      </div>
+      <div class="space-y-2">
+        ${pendingClients.map(c => {
+          const pct = c.globalEarned > 0 ? Math.min(100, Math.round(c.globalPaid / c.globalEarned * 100)) : 0;
+          return `<div class="border border-slate-100 rounded-xl p-4 hover:bg-slate-50/40">
+            <div class="flex items-center gap-3 mb-2">
+              <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:${c.color}"></span>
+              <span class="font-semibold text-slate-700 flex-1">${c.name}</span>
+              <span class="text-xs text-slate-400">${euro(c.globalPaid)} / ${euro(c.globalEarned)}</span>
+              <span class="font-bold text-amber-600 text-sm">${euro(c.pending)}</span>
+              <button onclick="payClient(${c.id})"
+                class="ml-2 px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-medium hover:bg-indigo-700 transition-colors">
+                Registra Pagamento
+              </button>
+            </div>
+            <div class="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+              <div class="h-full bg-emerald-400" style="width:${pct}%"></div>
+            </div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>` : ''}
+
+    ${byClient.some(c => c.periodHours > 0 || c.periodPaid > 0) ? `
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6 mb-6">
+      <h3 class="font-semibold text-slate-700 mb-5">Riepilogo per Cliente <span class="text-xs font-normal text-slate-400">(${monthLabel(month)})</span></h3>
       <div class="overflow-x-auto">
         <table class="w-full text-sm">
           <thead>
             <tr class="border-b border-slate-100">
               <th class="text-left py-2 px-3 text-slate-400 font-medium">Cliente</th>
               <th class="text-right py-2 px-3 text-slate-400 font-medium">Tariffa</th>
-              <th class="text-right py-2 px-3 text-slate-400 font-medium">Ore Tot.</th>
-              <th class="text-right py-2 px-3 text-slate-400 font-medium">Guadagno</th>
+              <th class="text-right py-2 px-3 text-slate-400 font-medium">Ore</th>
+              <th class="text-right py-2 px-3 text-slate-400 font-medium">Guadagnato</th>
+              <th class="text-right py-2 px-3 text-slate-400 font-medium">Pagato</th>
+              <th class="text-right py-2 px-3 text-slate-400 font-medium">Pendente (tot.)</th>
             </tr>
           </thead>
           <tbody>
-            ${stats.by_client.map(c=>`
+            ${byClient.filter(c => c.periodHours > 0 || c.periodPaid > 0 || c.pending > 0.005).map(c=>`
             <tr class="border-b border-slate-50 hover:bg-slate-50">
               <td class="py-2.5 px-3">
                 <div class="flex items-center gap-2">
-                  <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:${c.client_color}"></span>
-                  <span class="font-medium text-slate-700">${c.client_name}</span>
+                  <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:${c.color}"></span>
+                  <span class="font-medium text-slate-700">${c.name}</span>
                 </div>
               </td>
               <td class="py-2.5 px-3 text-right text-slate-500">${euro(c.hourly_rate)}/h</td>
-              <td class="py-2.5 px-3 text-right text-slate-600">${fmtHours(c.total_hours)}</td>
-              <td class="py-2.5 px-3 text-right font-semibold text-emerald-600">${euro(c.total_earnings)}</td>
+              <td class="py-2.5 px-3 text-right text-slate-600">${fmtHours(c.periodHours)}</td>
+              <td class="py-2.5 px-3 text-right font-semibold text-emerald-600">${euro(c.periodEarned)}</td>
+              <td class="py-2.5 px-3 text-right text-indigo-600">${euro(c.periodPaid)}</td>
+              <td class="py-2.5 px-3 text-right ${c.pending>0.005?'text-amber-600 font-semibold':'text-slate-400'}">${euro(c.pending)}</td>
             </tr>`).join('')}
             <tr class="bg-slate-50 font-semibold">
               <td class="py-2.5 px-3 text-slate-700" colspan="2">Totale</td>
-              <td class="py-2.5 px-3 text-right text-slate-700">${fmtHours(stats.total_hours)}</td>
-              <td class="py-2.5 px-3 text-right text-emerald-600">${euro(stats.total_earnings)}</td>
+              <td class="py-2.5 px-3 text-right text-slate-700">${fmtHours(periodHours)}</td>
+              <td class="py-2.5 px-3 text-right text-emerald-600">${euro(periodEarned)}</td>
+              <td class="py-2.5 px-3 text-right text-indigo-600">${euro(periodPaid)}</td>
+              <td class="py-2.5 px-3 text-right text-amber-600">${euro(globalPending)}</td>
             </tr>
           </tbody>
         </table>
@@ -521,11 +643,11 @@ function renderDashboard(el) {
     <!-- Finance Overview -->
     ${accounts.length ? `
     <div class="mb-6">
-      <h3 class="text-lg font-bold text-slate-800 mb-4">Panoramica Finanze</h3>
+      <h3 class="text-lg font-bold text-slate-800 mb-4">Panoramica Finanze <span class="text-xs font-normal text-slate-400">(${monthLabel(month)})</span></h3>
       <div class="grid grid-cols-2 xl:grid-cols-4 gap-5 mb-6">
         ${kpi('Saldo Totale', euro(finStats?.total_balance||0), 'text-indigo-600', 'bg-indigo-50', 'M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z')}
-        ${kpi('Entrate Totali', euro(finStats?.total_income||0), 'text-emerald-600', 'bg-emerald-50', 'M7 11l5-5m0 0l5 5m-5-5v12')}
-        ${kpi('Uscite Totali', euro(finStats?.total_expenses||0), 'text-red-600', 'bg-red-50', 'M17 13l-5 5m0 0l-5-5m5 5V1')}
+        ${kpi('Entrate', euro(filteredTxs.filter(t=>t.type==='income').reduce((a,t)=>a+t.amount,0)), 'text-emerald-600', 'bg-emerald-50', 'M7 11l5-5m0 0l5 5m-5-5v12')}
+        ${kpi('Uscite', euro(filteredTxs.filter(t=>t.type==='expense').reduce((a,t)=>a+t.amount,0)), 'text-red-600', 'bg-red-50', 'M17 13l-5 5m0 0l-5-5m5 5V1')}
         ${kpi('Conti Attivi', accounts.length, 'text-violet-600', 'bg-violet-50', 'M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4')}
       </div>
       <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 mb-6">
@@ -542,27 +664,37 @@ function renderDashboard(el) {
       </div>
     </div>
 
-    ${finStats?.expenses_by_category?.length ? `
-    <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
-      <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6">
-        <h3 class="font-semibold text-slate-700 mb-5">Spese per Categoria</h3>
-        <div class="flex justify-center"><canvas id="ch-expense-pie" width="260" height="260"></canvas></div>
-      </div>
-      <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6">
-        <h3 class="font-semibold text-slate-700 mb-5">Dettaglio Categorie</h3>
-        <div class="space-y-2">
-          ${finStats.expenses_by_category.map(c => {
-            const pct = finStats.total_expenses > 0 ? Math.round(c.amount / finStats.total_expenses * 100) : 0;
-            return `<div class="flex items-center gap-3">
-              <span class="w-3 h-3 rounded-full flex-shrink-0" style="background:${catColor(c.category)}"></span>
-              <span class="text-sm text-slate-700 flex-1">${c.category}</span>
-              <span class="text-sm text-slate-400">${pct}%</span>
-              <span class="text-sm font-semibold text-red-600 w-24 text-right">${euro(c.amount)}</span>
-            </div>`;
-          }).join('')}
+    ${(() => {
+      const byCat = {};
+      filteredTxs.filter(t => t.type === 'expense').forEach(t => {
+        const cat = t.category || 'Altro';
+        byCat[cat] = (byCat[cat] || 0) + t.amount;
+      });
+      const expEntries = Object.entries(byCat).sort((a,b) => b[1]-a[1]);
+      const totalExp = expEntries.reduce((a,e) => a+e[1], 0);
+      window.__expCatCache = { entries: expEntries, total: totalExp };
+      return expEntries.length ? `
+      <div class="grid grid-cols-1 xl:grid-cols-2 gap-6 mb-6">
+        <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6">
+          <h3 class="font-semibold text-slate-700 mb-5">Spese per Categoria</h3>
+          <div class="flex justify-center"><canvas id="ch-expense-pie" width="260" height="260"></canvas></div>
         </div>
-      </div>
-    </div>` : ''}
+        <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6">
+          <h3 class="font-semibold text-slate-700 mb-5">Dettaglio Categorie</h3>
+          <div class="space-y-2">
+            ${expEntries.map(([cat,amount]) => {
+              const pct = totalExp > 0 ? Math.round(amount / totalExp * 100) : 0;
+              return `<div class="flex items-center gap-3">
+                <span class="w-3 h-3 rounded-full flex-shrink-0" style="background:${catColor(cat)}"></span>
+                <span class="text-sm text-slate-700 flex-1">${cat}</span>
+                <span class="text-sm text-slate-400">${pct}%</span>
+                <span class="text-sm font-semibold text-red-600 w-24 text-right">${euro(amount)}</span>
+              </div>`;
+            }).join('')}
+          </div>
+        </div>
+      </div>` : '';
+    })()}
 
     ${finStats?.account_history?.length ? `
     <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-6 mb-6">
@@ -575,11 +707,12 @@ function renderDashboard(el) {
         <h3 class="font-semibold text-slate-700">Ultimi Movimenti</h3>
         <button onclick="navigate('transactions')" class="text-indigo-600 text-sm font-medium hover:text-indigo-700">Vedi tutti →</button>
       </div>
-      ${transactions.length ? `
+      ${filteredTxs.length ? `
       <div class="space-y-1">
-        ${transactions.slice(0,8).map(t => {
+        ${filteredTxs.slice(0,8).map(t => {
           const acc = accounts.find(a=>a.id===t.account_id);
           const toAcc = t.to_account_id ? accounts.find(a=>a.id===t.to_account_id) : null;
+          const cl  = t.client_id ? clientById(t.client_id) : null;
           const isExp = t.type==='expense';
           const isTr = t.type==='transfer';
           return `<div class="flex items-center gap-3 py-2 px-3 rounded-lg hover:bg-slate-50 text-sm">
@@ -587,29 +720,30 @@ function renderDashboard(el) {
               ${isExp?'↓':isTr?'↔':'↑'}
             </span>
             <span class="text-slate-400 w-20 flex-shrink-0">${fmtDate(t.date)}</span>
-            <span class="font-medium text-slate-700 flex-1 truncate">${isTr ? (acc?.name||'')+ ' → '+(toAcc?.name||'') : (t.category||t.description||'—')}</span>
+            <span class="font-medium text-slate-700 flex-1 truncate">${isTr ? (acc?.name||'')+ ' → '+(toAcc?.name||'') : (cl?`${cl.name} — `:'')+(t.category||t.description||'—')}</span>
             <span class="text-slate-400 truncate max-w-32">${acc?.name||''}</span>
             <span class="font-semibold w-24 text-right ${isExp?'text-red-600':isTr?'text-blue-600':'text-emerald-600'}">
               ${isExp?'−':isTr?'':'+'} ${euro(t.amount)}
             </span>
           </div>`;
         }).join('')}
-      </div>` : `<p class="text-slate-400 text-sm text-center py-6">Nessun movimento registrato</p>`}
+      </div>` : `<p class="text-slate-400 text-sm text-center py-6">Nessun movimento nel periodo</p>`}
     </div>` : ''}
   `;
 
   setTimeout(() => {
-    // Doughnut
-    if (stats?.by_client?.length) {
+    // Doughnut: guadagni per cliente nel periodo
+    const pieData = byClient.filter(c => c.periodEarned > 0);
+    if (pieData.length) {
       const ctx = document.getElementById('ch-pie');
       if (ctx) {
         destroyChart('pie');
         charts['pie'] = new Chart(ctx, {
           type: 'doughnut',
           data: {
-            labels: stats.by_client.map(c=>c.client_name),
-            datasets:[{ data: stats.by_client.map(c=>c.total_earnings),
-              backgroundColor: stats.by_client.map(c=>c.client_color),
+            labels: pieData.map(c=>c.name),
+            datasets:[{ data: pieData.map(c=>c.periodEarned),
+              backgroundColor: pieData.map(c=>c.color),
               borderWidth:2, borderColor:'#fff', hoverOffset:5 }]
           },
           options: {
@@ -644,17 +778,18 @@ function renderDashboard(el) {
         }
       });
     }
-    // Expense doughnut
-    if (finStats?.expenses_by_category?.length) {
+    // Expense doughnut (period-filtered)
+    const expCache = window.__expCatCache;
+    if (expCache && expCache.entries.length) {
       const eCtx = document.getElementById('ch-expense-pie');
       if (eCtx) {
         destroyChart('expPie');
         charts['expPie'] = new Chart(eCtx, {
           type: 'doughnut',
           data: {
-            labels: finStats.expenses_by_category.map(c=>c.category),
-            datasets:[{ data: finStats.expenses_by_category.map(c=>c.amount),
-              backgroundColor: finStats.expenses_by_category.map(c=>catColor(c.category)),
+            labels: expCache.entries.map(e => e[0]),
+            datasets:[{ data: expCache.entries.map(e => e[1]),
+              backgroundColor: expCache.entries.map(e => catColor(e[0])),
               borderWidth:2, borderColor:'#fff', hoverOffset:5 }]
           },
           options: {
@@ -709,6 +844,25 @@ function renderDashboard(el) {
       }
     }
   }, 30);
+}
+
+// Quick action: registra pagamento per un cliente con saldo pendente
+function payClient(clientId) {
+  const c = clients.find(x => x.id === clientId);
+  if (!c) return;
+  // Calcola pendente attuale
+  const allSessions = sessions.filter(s => s.client_id === clientId);
+  const allPayments = transactions.filter(t => t.type === 'income' && t.client_id === clientId);
+  const earned = allSessions.reduce((a,s) => a + s.hours, 0) * c.hourly_rate;
+  const paid   = allPayments.reduce((a,t) => a + t.amount, 0);
+  const pending = Math.max(0, Math.round((earned - paid) * 100) / 100);
+  openTransactionModal(null, {
+    type: 'income',
+    client_id: clientId,
+    account_id: c.account_id || null,
+    amount: pending,
+    description: `Pagamento da ${c.name}`,
+  });
 }
 
 function kpi(label, value, textCls, bgCls, path) {
@@ -881,18 +1035,35 @@ function renderClients(el) {
 }
 
 // ─── Sessions view ────────────────────────────────────────────────────────────
+function setSessionsMonth(v) { sessionsMonth = v; renderSessions(document.getElementById('content')); }
+
 function renderSessions(el) {
-  const sorted = [...sessions]; // already sorted by backend
+  const months = [...new Set(sessions.map(s => s.date.slice(0,7)))].sort().reverse();
+  const sorted = sessionsMonth
+    ? sessions.filter(s => s.date.startsWith(sessionsMonth))
+    : [...sessions];
+  const totalH = sorted.reduce((a,s)=>a+s.hours, 0);
+  const totalEarn = sorted.reduce((a,s) => {
+    const c = clientById(s.client_id);
+    return a + (c ? s.hours * c.hourly_rate : 0);
+  }, 0);
 
   el.innerHTML = `
-    <div class="mb-7 flex items-center justify-between">
+    <div class="mb-7 flex items-start justify-between flex-wrap gap-3">
       <div>
         <h2 class="text-2xl font-bold text-slate-800">Sessioni</h2>
-        <p class="text-slate-500 mt-1 text-sm">${sessions.length} sessioni registrate</p>
+        <p class="text-slate-500 mt-1 text-sm">${sorted.length} sessioni · ${fmtHours(totalH)} · ${euro(totalEarn)}</p>
       </div>
-      <button onclick="openSessionModal()" class="bg-indigo-600 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors">
-        + Nuova Sessione
-      </button>
+      <div class="flex items-center gap-2 flex-wrap">
+        <select onchange="setSessionsMonth(this.value)"
+          class="px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          <option value="" ${sessionsMonth===''?'selected':''}>Tutti i periodi</option>
+          ${months.map(m => `<option value="${m}" ${m===sessionsMonth?'selected':''}>${monthLabel(m)}</option>`).join('')}
+        </select>
+        <button onclick="openSessionModal()" class="bg-indigo-600 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors">
+          + Nuova Sessione
+        </button>
+      </div>
     </div>
 
     <div class="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
@@ -1001,6 +1172,10 @@ function renderAccounts(el) {
                 </div>
               </div>
               <div class="flex gap-1">
+                <button onclick="openReconcileModal(${a.id})" title="Ripareggia saldo"
+                  class="w-8 h-8 rounded-lg hover:bg-amber-50 flex items-center justify-center text-slate-400 hover:text-amber-600">
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 6a3 3 0 013-3h12a3 3 0 013 3v2a3 3 0 01-3 3H6a3 3 0 01-3-3V6zm0 10a3 3 0 013-3h12a3 3 0 013 3v2a3 3 0 01-3 3H6a3 3 0 01-3-3v-2zM7 16h.01M7 6h.01"/></svg>
+                </button>
                 <button onclick="openAccountModal(${a.id})"
                   class="w-8 h-8 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-400 hover:text-slate-600">
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
@@ -1025,18 +1200,32 @@ function renderAccounts(el) {
 // ─── Transactions view ───────────────────────────────────────────────────────
 function accountById(id) { return accounts.find(a => a.id === id) || null; }
 
+function setTransactionsMonth(v) { transactionsMonth = v; renderTransactions(document.getElementById('content')); }
+
 function renderTransactions(el) {
-  const sorted = [...transactions]; // already sorted by backend
+  const months = [...new Set(transactions.map(t => t.date.slice(0,7)))].sort().reverse();
+  const sorted = transactionsMonth
+    ? transactions.filter(t => t.date.startsWith(transactionsMonth))
+    : [...transactions];
+  const periodIncome = sorted.filter(t=>t.type==='income').reduce((a,t)=>a+t.amount,0);
+  const periodExp    = sorted.filter(t=>t.type==='expense').reduce((a,t)=>a+t.amount,0);
 
   el.innerHTML = `
-    <div class="mb-7 flex items-center justify-between">
+    <div class="mb-7 flex items-start justify-between flex-wrap gap-3">
       <div>
         <h2 class="text-2xl font-bold text-slate-800">Movimenti</h2>
-        <p class="text-slate-500 mt-1 text-sm">${transactions.length} moviment${transactions.length!==1?'i':'o'} registrat${transactions.length!==1?'i':'o'}</p>
+        <p class="text-slate-500 mt-1 text-sm">${sorted.length} movimenti · <span class="text-emerald-600">+${euro(periodIncome)}</span> · <span class="text-red-600">−${euro(periodExp)}</span></p>
       </div>
-      <button onclick="openTransactionModal()" class="bg-indigo-600 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors">
-        + Nuovo Movimento
-      </button>
+      <div class="flex items-center gap-2 flex-wrap">
+        <select onchange="setTransactionsMonth(this.value)"
+          class="px-3 py-2 rounded-xl border border-slate-200 bg-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300">
+          <option value="" ${transactionsMonth===''?'selected':''}>Tutti i periodi</option>
+          ${months.map(m => `<option value="${m}" ${m===transactionsMonth?'selected':''}>${monthLabel(m)}</option>`).join('')}
+        </select>
+        <button onclick="openTransactionModal()" class="bg-indigo-600 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors">
+          + Nuovo Movimento
+        </button>
+      </div>
     </div>
 
     <div class="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
@@ -1072,6 +1261,7 @@ function renderTransactions(el) {
               const isTr = t.type==='transfer';
               const typeLabel = isExp?'Uscita':isTr?'Trasferimento':'Entrata';
               const typeCls = isExp?'bg-red-50 text-red-600':isTr?'bg-blue-50 text-blue-600':'bg-emerald-50 text-emerald-600';
+              const linkedClient = t.client_id ? clients.find(c => c.id === t.client_id) : null;
               return `
               <tr class="border-b border-slate-50 hover:bg-slate-50/60 transition-colors">
                 <td class="py-3 px-4 text-slate-500">${fmtDate(t.date)}</td>
@@ -1089,7 +1279,10 @@ function renderTransactions(el) {
                   ${isTr ? `${acc?.name||'?'} → ${toAcc?.name||'?'}` : (acc?.name||'—')}
                 </td>
                 <td class="py-3 px-4 text-slate-400 max-w-xs">
-                  <span class="truncate block max-w-xs" title="${t.description||''}">${t.description||'—'}</span>
+                  <div class="flex items-center gap-2 max-w-xs">
+                    ${linkedClient ? `<span class="px-2 py-0.5 rounded-md text-xs font-medium flex-shrink-0" style="background:${linkedClient.color}20;color:${linkedClient.color}">${linkedClient.name}</span>` : ''}
+                    <span class="truncate" title="${t.description||''}">${t.description||(linkedClient?'':'—')}</span>
+                  </div>
                 </td>
                 <td class="py-3 px-4 text-right font-semibold ${isExp?'text-red-600':isTr?'text-blue-600':'text-emerald-600'}">
                   ${isExp?'−':isTr?'':'+'} ${euro(t.amount)}
@@ -1119,6 +1312,7 @@ function renderTransactions(el) {
 function openClientModal(clientId = null) {
   const c = clientId ? clients.find(x => x.id === clientId) : null;
   const defColor = c?.color || PALETTE[clients.length % PALETTE.length];
+  const rateValue = c ? (c.hourly_rate ?? '') : '';
 
   document.getElementById('modal-body').innerHTML = `
     <div class="p-6">
@@ -1136,10 +1330,20 @@ function openClientModal(clientId = null) {
         <div>
           <label class="block text-sm font-medium text-slate-700 mb-1.5">Tariffa Oraria *</label>
           <div class="relative">
-            <input id="c-rate" type="number" min="0" step="0.5" value="${c?.hourly_rate||''}" placeholder="25.00"
+            <input id="c-rate" type="number" min="0" step="0.5" value="${rateValue}" placeholder="25.00"
               class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm pr-12" />
             <span class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm font-medium">€/h</span>
           </div>
+          <p class="text-xs text-slate-400 mt-1">Imposta a 0 per attività non retribuite (pro-bono)</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Conto Predefinito Pagamenti</label>
+          <select id="c-account"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm">
+            <option value="">Nessuno</option>
+            ${accounts.map(a => `<option value="${a.id}" ${c?.account_id===a.id?'selected':''}>${a.icon} ${a.name}</option>`).join('')}
+          </select>
+          <p class="text-xs text-slate-400 mt-1">Conto su cui registrare i pagamenti ricevuti da questo cliente</p>
         </div>
         <div>
           <label class="block text-sm font-medium text-slate-700 mb-2">Colore</label>
@@ -1175,19 +1379,24 @@ function pickColor(col) {
 }
 
 async function saveClient(id) {
-  const name  = document.getElementById('c-name').value.trim();
-  const rate  = parseFloat(document.getElementById('c-rate').value);
-  const color = document.getElementById('c-color').value;
+  const name     = document.getElementById('c-name').value.trim();
+  const rateRaw  = document.getElementById('c-rate').value;
+  const rate     = parseFloat(rateRaw);
+  const color    = document.getElementById('c-color').value;
+  const accSel   = document.getElementById('c-account').value;
+  const accountId = accSel ? parseInt(accSel) : null;
 
-  if (!name)         return toast('Inserisci il nome del cliente', true);
-  if (!rate||rate<=0) return toast('Inserisci una tariffa oraria valida', true);
+  if (!name)                       return toast('Inserisci il nome del cliente', true);
+  if (rateRaw === '' || isNaN(rate) || rate < 0) return toast('Inserisci una tariffa oraria valida (0 o più)', true);
+
+  const body = { name, hourly_rate: rate, color, account_id: accountId };
 
   try {
     if (id) {
-      await req('PUT', `/clients/${id}`, { name, hourly_rate: rate, color });
+      await req('PUT', `/clients/${id}`, body);
       toast('Cliente aggiornato!');
     } else {
-      await req('POST', '/clients', { name, hourly_rate: rate, color });
+      await req('POST', '/clients', body);
       toast('Cliente creato!');
     }
     closeModal();
@@ -1435,6 +1644,89 @@ async function confirmDeleteAccount(id, name) {
   } catch(e) { toast(e.message, true); }
 }
 
+// ─── Reconcile (ripareggiamento) modal ──────────────────────────────────────
+function openReconcileModal(accountId) {
+  const a = accounts.find(x => x.id === accountId);
+  if (!a) return;
+  const bal = finStats?.account_balances?.find(b => b.account_id === accountId);
+  const currentBal = bal?.balance ?? a.initial_balance;
+  const today = new Date().toISOString().slice(0,10);
+
+  document.getElementById('modal-body').innerHTML = `
+    <div class="p-6">
+      <div class="flex items-center justify-between mb-6">
+        <h3 class="text-base font-semibold text-slate-800">Ripareggia "${a.name}"</h3>
+        <button onclick="closeModal()" class="w-8 h-8 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-400">✕</button>
+      </div>
+
+      <div class="bg-slate-50 rounded-xl p-4 mb-4">
+        <p class="text-xs text-slate-400 mb-1">Saldo attuale registrato</p>
+        <p class="text-xl font-bold ${currentBal>=0?'text-emerald-600':'text-red-600'}">${euro(currentBal)}</p>
+      </div>
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Saldo Reale *</label>
+          <div class="relative">
+            <input id="r-target" type="number" step="0.01" value="${currentBal.toFixed(2)}" oninput="updateReconcileDiff()"
+              class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm pr-10" />
+            <span class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm font-medium">€</span>
+          </div>
+          <p id="r-diff-info" class="text-xs text-slate-400 mt-1">Verrà generato un movimento per pareggiare il saldo</p>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Data</label>
+          <input id="r-date" type="date" value="${today}"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Descrizione</label>
+          <input id="r-desc" type="text" placeholder="(opzionale)"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm" />
+        </div>
+      </div>
+
+      <div class="flex gap-3 mt-6">
+        <button onclick="closeModal()" class="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-sm font-medium">Annulla</button>
+        <button onclick="saveReconcile(${accountId}, ${currentBal})" class="flex-1 py-2.5 rounded-xl bg-amber-600 text-white hover:bg-amber-700 text-sm font-medium">
+          Ripareggia
+        </button>
+      </div>
+    </div>
+  `;
+  showModal();
+  setTimeout(() => document.getElementById('r-target').focus(), 50);
+}
+
+function updateReconcileDiff() {
+  const target = parseFloat(document.getElementById('r-target').value);
+  const info = document.getElementById('r-diff-info');
+  if (isNaN(target)) { info.textContent = 'Inserisci un valore numerico'; return; }
+  // Read current balance from previously embedded value (stored on input default)
+  // We'll re-derive it from finStats
+  // Note: this function is called frequently; keep it simple
+  info.textContent = 'Verrà generato un movimento di adeguamento se diverso dal saldo attuale';
+}
+
+async function saveReconcile(accountId, currentBalance) {
+  const target = parseFloat(document.getElementById('r-target').value);
+  const date   = document.getElementById('r-date').value || null;
+  const desc   = document.getElementById('r-desc').value.trim() || null;
+  if (isNaN(target)) return toast('Inserisci un saldo valido', true);
+  if (Math.abs(target - currentBalance) < 0.005) return toast('Il saldo è già allineato', true);
+  try {
+    await req('POST', `/accounts/${accountId}/reconcile`, {
+      target_balance: target,
+      date,
+      description: desc,
+    });
+    toast('Saldo ripareggiato');
+    closeModal();
+    await reload();
+    navigate(view);
+  } catch(e) { toast(e.message, true); }
+}
+
 // ─── Categories view ────────────────────────────────────────────────────────
 function renderCategories(el) {
   const expCats = categoriesData.filter(c => c.type === 'expense');
@@ -1613,10 +1905,15 @@ async function confirmDeleteCategory(id, name) {
 }
 
 // ─── Transaction modal ───────────────────────────────────────────────────────
-function openTransactionModal(txId = null) {
+// prefill può essere un oggetto { type, client_id, account_id, amount, description }
+function openTransactionModal(txId = null, prefill = null) {
   const t = txId ? transactions.find(x => x.id === txId) : null;
-  const defType = t?.type || 'expense';
+  const defType = t?.type || prefill?.type || 'expense';
   const defaultDate = t?.date || new Date().toISOString().slice(0,10);
+  const defClientId = t?.client_id ?? prefill?.client_id ?? null;
+  const defAccountId = t?.account_id ?? prefill?.account_id ?? null;
+  const defAmount = t?.amount ?? prefill?.amount ?? '';
+  const defDesc = t?.description ?? prefill?.description ?? '';
 
   document.getElementById('modal-body').innerHTML = `
     <div class="p-6">
@@ -1648,7 +1945,7 @@ function openTransactionModal(txId = null) {
         <div>
           <label class="block text-sm font-medium text-slate-700 mb-1.5">Importo *</label>
           <div class="relative">
-            <input id="t-amount" type="number" min="0.01" step="0.01" value="${t?.amount||''}" placeholder="0.00"
+            <input id="t-amount" type="number" min="0.01" step="0.01" value="${defAmount}" placeholder="0.00"
               class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm pr-10" />
             <span class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm font-medium">€</span>
           </div>
@@ -1664,7 +1961,7 @@ function openTransactionModal(txId = null) {
           <label class="block text-sm font-medium text-slate-700 mb-1.5" id="t-account-label">Conto *</label>
           <select id="t-account" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm">
             <option value="">Seleziona conto…</option>
-            ${accounts.map(a => `<option value="${a.id}" ${t?.account_id===a.id?'selected':''}>${a.icon} ${a.name}</option>`).join('')}
+            ${accounts.map(a => `<option value="${a.id}" ${defAccountId===a.id?'selected':''}>${a.icon} ${a.name}</option>`).join('')}
           </select>
         </div>
 
@@ -1674,6 +1971,16 @@ function openTransactionModal(txId = null) {
             <option value="">Seleziona conto…</option>
             ${accounts.map(a => `<option value="${a.id}" ${t?.to_account_id===a.id?'selected':''}>${a.icon} ${a.name}</option>`).join('')}
           </select>
+        </div>
+
+        <div id="t-client-row" class="${defType==='income'?'':'hidden'}">
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Cliente (per pagamento ore)</label>
+          <select id="t-client" onchange="onTxClientChange()"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm">
+            <option value="">Nessuno</option>
+            ${clients.map(cl => `<option value="${cl.id}" ${defClientId===cl.id?'selected':''}>${cl.name}</option>`).join('')}
+          </select>
+          <p class="text-xs text-slate-400 mt-1">Collega questa entrata a un cliente per scalare i suoi crediti pendenti</p>
         </div>
 
         <div id="t-category-row" class="${defType==='transfer'?'hidden':''}">
@@ -1687,7 +1994,7 @@ function openTransactionModal(txId = null) {
         <div>
           <label class="block text-sm font-medium text-slate-700 mb-1.5">Descrizione</label>
           <textarea id="t-desc" rows="2" placeholder="Dettagli del movimento…"
-            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm resize-none">${t?.description||''}</textarea>
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm resize-none">${defDesc}</textarea>
         </div>
       </div>
 
@@ -1703,6 +2010,19 @@ function openTransactionModal(txId = null) {
   showModal();
 }
 
+// When user picks a client in the income transaction modal, auto-fill account
+function onTxClientChange() {
+  const sel = document.getElementById('t-client');
+  if (!sel) return;
+  const id = parseInt(sel.value);
+  if (!id) return;
+  const cl = clients.find(c => c.id === id);
+  if (cl?.account_id) {
+    const accSel = document.getElementById('t-account');
+    if (accSel && !accSel.value) accSel.value = String(cl.account_id);
+  }
+}
+
 function setTxType(type) {
   document.getElementById('t-type').value = type;
   // Update button styles
@@ -1713,15 +2033,18 @@ function setTxType(type) {
   const btn = document.querySelector(`[data-txtype="${type}"]`);
   if (btn) btn.className = `py-2 rounded-xl text-sm font-medium border-2 transition-colors ${colors[type]}`;
 
-  // Toggle transfer/category fields
+  // Toggle transfer / category / client fields
   const isTransfer = type === 'transfer';
+  const isIncome = type === 'income';
   document.getElementById('t-to-account-row').classList.toggle('hidden', !isTransfer);
   document.getElementById('t-category-row').classList.toggle('hidden', isTransfer);
+  const clientRow = document.getElementById('t-client-row');
+  if (clientRow) clientRow.classList.toggle('hidden', !isIncome);
   document.getElementById('t-account-label').textContent = isTransfer ? 'Conto Origine *' : 'Conto *';
 
   // Update category options
   if (!isTransfer) {
-    const cats = type === 'income' ? INCOME_CATS() : EXPENSE_CATS();
+    const cats = isIncome ? INCOME_CATS() : EXPENSE_CATS();
     const sel = document.getElementById('t-category');
     const current = sel.value;
     sel.innerHTML = '<option value="">Seleziona categoria…</option>' + cats.map(c => `<option value="${c}" ${c===current?'selected':''}>${c}</option>`).join('');
@@ -1736,6 +2059,9 @@ async function saveTransaction(id) {
   const toAccId   = type === 'transfer' ? parseInt(document.getElementById('t-to-account').value) : null;
   const category  = type !== 'transfer' ? document.getElementById('t-category').value : '';
   const desc      = document.getElementById('t-desc').value.trim();
+  const clientSelEl = document.getElementById('t-client');
+  const clientSel = clientSelEl ? clientSelEl.value : '';
+  const clientId  = type === 'income' && clientSel ? parseInt(clientSel) : null;
 
   if (!amount || amount <= 0)  return toast('Inserisci un importo valido', true);
   if (!date)                   return toast('Seleziona una data', true);
@@ -1743,7 +2069,7 @@ async function saveTransaction(id) {
   if (type === 'transfer' && !toAccId) return toast('Seleziona il conto di destinazione', true);
   if (type === 'transfer' && accountId === toAccId) return toast('I conti devono essere diversi', true);
 
-  const body = { type, amount, date, category, description: desc, account_id: accountId, to_account_id: toAccId };
+  const body = { type, amount, date, category, description: desc, account_id: accountId, to_account_id: toAccId, client_id: clientId };
 
   try {
     if (id) {

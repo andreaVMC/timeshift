@@ -37,9 +37,11 @@ class Client(Base):
     name = Column(String, nullable=False)
     hourly_rate = Column(Float, nullable=False)
     color = Column(String, default="#6366F1")
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     sessions = relationship("WorkSession", back_populates="client", cascade="all, delete-orphan")
+    account = relationship("Account", foreign_keys=[account_id])
 
 
 class WorkSession(Base):
@@ -79,10 +81,12 @@ class Transaction(Base):
     description = Column(Text, default="")
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
     to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     account = relationship("Account", foreign_keys=[account_id])
     to_account = relationship("Account", foreign_keys=[to_account_id])
+    client = relationship("Client", foreign_keys=[client_id])
 
 
 class Category(Base):
@@ -117,6 +121,20 @@ class AuthToken(Base):
 
 
 Base.metadata.create_all(bind=engine)
+
+
+# ── Migrations: add columns to existing SQLite tables if missing ────────────
+def _migrate():
+    with engine.connect() as conn:
+        cli_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(clients)").fetchall()]
+        if "account_id" not in cli_cols:
+            conn.exec_driver_sql("ALTER TABLE clients ADD COLUMN account_id INTEGER REFERENCES accounts(id)")
+        tx_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(transactions)").fetchall()]
+        if "client_id" not in tx_cols:
+            conn.exec_driver_sql("ALTER TABLE transactions ADD COLUMN client_id INTEGER REFERENCES clients(id)")
+        conn.commit()
+
+_migrate()
 
 
 # ── Seed default categories ──────────────────────────────────────────────────
@@ -300,12 +318,14 @@ class ClientCreate(BaseModel):
     name: str
     hourly_rate: float
     color: str = "#6366F1"
+    account_id: Optional[int] = None
 
 
 class ClientUpdate(BaseModel):
     name: Optional[str] = None
     hourly_rate: Optional[float] = None
     color: Optional[str] = None
+    account_id: Optional[int] = None
 
 
 class ClientOut(BaseModel):
@@ -313,6 +333,7 @@ class ClientOut(BaseModel):
     name: str
     hourly_rate: float
     color: str
+    account_id: Optional[int] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -410,6 +431,7 @@ class TransactionCreate(BaseModel):
     description: str = ""
     account_id: int
     to_account_id: Optional[int] = None
+    client_id: Optional[int] = None
 
 
 class TransactionUpdate(BaseModel):
@@ -420,6 +442,7 @@ class TransactionUpdate(BaseModel):
     description: Optional[str] = None
     account_id: Optional[int] = None
     to_account_id: Optional[int] = None
+    client_id: Optional[int] = None
 
 
 class TransactionOut(BaseModel):
@@ -431,6 +454,7 @@ class TransactionOut(BaseModel):
     description: str
     account_id: int
     to_account_id: Optional[int]
+    client_id: Optional[int] = None
     account: AccountOut
     to_account: Optional[AccountOut]
     created_at: datetime
@@ -482,6 +506,8 @@ def delete_client(client_id: int, db: Session = Depends(get_db), _: User = Depen
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Cliente non trovato")
+    # Unlink transactions that referenced this client (keep the income records)
+    db.query(Transaction).filter(Transaction.client_id == client_id).update({Transaction.client_id: None})
     db.delete(client)
     db.commit()
 
@@ -579,6 +605,8 @@ def delete_account(account_id: int, db: Session = Depends(get_db), _: User = Dep
         db.query(Transaction).filter(
             (Transaction.account_id == account_id) | (Transaction.to_account_id == account_id)
         ).delete(synchronize_session=False)
+    # Unlink any client that pointed to this account as default payment account
+    db.query(Client).filter(Client.account_id == account_id).update({Client.account_id: None})
     db.delete(account)
     db.commit()
 
@@ -639,6 +667,11 @@ def create_transaction(data: TransactionCreate, db: Session = Depends(get_db), _
         raise HTTPException(status_code=422, detail="Seleziona il conto di destinazione")
     if data.type == "transfer" and data.account_id == data.to_account_id:
         raise HTTPException(status_code=422, detail="Il conto di origine e destinazione devono essere diversi")
+    if data.client_id is not None:
+        if data.type != "income":
+            raise HTTPException(status_code=422, detail="Solo le entrate possono essere collegate a un cliente")
+        if not db.query(Client).filter(Client.id == data.client_id).first():
+            raise HTTPException(status_code=404, detail="Cliente non trovato")
     tx = Transaction(**data.model_dump())
     db.add(tx)
     db.commit()
@@ -667,12 +700,77 @@ def delete_transaction(tx_id: int, db: Session = Depends(get_db), _: User = Depe
     db.commit()
 
 
+# ── Account reconciliation ───────────────────────────────────────────────────
+
+class ReconcileRequest(BaseModel):
+    target_balance: float
+    date: Optional[str] = None
+    description: Optional[str] = None
+
+
+def _account_balance(db: Session, account_id: int, initial_balance: float) -> float:
+    txs = db.query(Transaction).filter(
+        (Transaction.account_id == account_id) | (Transaction.to_account_id == account_id)
+    ).all()
+    bal = initial_balance
+    for tx in txs:
+        if tx.type == "income" and tx.account_id == account_id:
+            bal += tx.amount
+        elif tx.type == "expense" and tx.account_id == account_id:
+            bal -= tx.amount
+        elif tx.type == "transfer":
+            if tx.account_id == account_id:
+                bal -= tx.amount
+            elif tx.to_account_id == account_id:
+                bal += tx.amount
+    return bal
+
+
+@app.post("/accounts/{account_id}/reconcile", response_model=TransactionOut, status_code=201)
+def reconcile_account(
+    account_id: int,
+    data: ReconcileRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    acc = db.query(Account).filter(Account.id == account_id).first()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Conto non trovato")
+
+    current = _account_balance(db, account_id, acc.initial_balance)
+    diff = round(data.target_balance - current, 2)
+    if diff == 0:
+        raise HTTPException(status_code=422, detail="Il saldo è già allineato")
+
+    tx_type = "income" if diff > 0 else "expense"
+    tx = Transaction(
+        type=tx_type,
+        amount=abs(diff),
+        date=data.date or datetime.utcnow().strftime("%Y-%m-%d"),
+        category="Ripareggiamento",
+        description=data.description or f"Ripareggiamento saldo a € {data.target_balance:.2f}",
+        account_id=account_id,
+    )
+    db.add(tx)
+    db.commit()
+    db.refresh(tx)
+    return tx
+
+
 # ── Finance stats endpoint ───────────────────────────────────────────────────
 
 @app.get("/finance-stats")
-def get_finance_stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def get_finance_stats(
+    month: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Stats finanziarie. ``account_balances`` è sempre attuale; i totali
+    flow (entrate/uscite/spese per categoria) sono filtrati al mese se
+    ``month`` è impostato."""
     accounts = db.query(Account).all()
     transactions = db.query(Transaction).all()
+    period_txs = [t for t in transactions if t.date.startswith(month)] if month else transactions
 
     account_balances = []
     total_balance = 0.0
@@ -700,15 +798,15 @@ def get_finance_stats(db: Session = Depends(get_db), _: User = Depends(get_curre
             "balance": round(balance, 2),
         })
 
-    for tx in transactions:
+    for tx in period_txs:
         if tx.type == "income":
             total_income += tx.amount
         elif tx.type == "expense":
             total_expenses += tx.amount
 
-    # Expenses by category
+    # Expenses by category (period-filtered)
     by_category = {}
-    for tx in transactions:
+    for tx in period_txs:
         if tx.type == "expense":
             cat = tx.category or "Altro"
             by_category[cat] = by_category.get(cat, 0) + tx.amount
@@ -928,30 +1026,83 @@ def bulk_create_transactions(payload: BulkTransactionsPayload, db: Session = Dep
 # ── Stats endpoint ────────────────────────────────────────────────────────────
 
 @app.get("/stats")
-def get_stats(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+def get_stats(
+    month: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Stats con tracking dei pagamenti.
+
+    Quando ``month`` (YYYY-MM) è impostato, ``total_hours``, ``total_earnings`` e
+    ``total_paid`` per cliente sono limitati al periodo. ``pending`` è sempre il
+    saldo globale del cliente (lavoro_totale_storico - pagamenti_totali_storici).
+    """
     clients = db.query(Client).all()
     by_client = []
-    total_hours = 0.0
-    total_earnings = 0.0
+    period_total_hours = 0.0
+    period_total_earnings = 0.0
+    period_total_paid = 0.0
+    global_total_pending = 0.0
+    global_total_earnings = 0.0
+    global_total_paid = 0.0
 
     for client in clients:
-        client_hours = sum(s.hours for s in client.sessions)
-        client_earnings = client_hours * client.hourly_rate
-        total_hours += client_hours
-        total_earnings += client_earnings
+        # Period-filtered slice
+        if month:
+            period_sessions = [s for s in client.sessions if s.date.startswith(month)]
+        else:
+            period_sessions = list(client.sessions)
+        period_hours = sum(s.hours for s in period_sessions)
+        period_earned = period_hours * client.hourly_rate
+
+        period_paid_q = db.query(Transaction).filter(
+            Transaction.client_id == client.id,
+            Transaction.type == "income",
+        )
+        if month:
+            period_paid_q = period_paid_q.filter(Transaction.date.like(f"{month}%"))
+        period_paid = sum(t.amount for t in period_paid_q.all())
+
+        # Global (all-time) values for pending balance
+        global_hours = sum(s.hours for s in client.sessions)
+        global_earned = global_hours * client.hourly_rate
+        global_paid = sum(
+            t.amount for t in db.query(Transaction).filter(
+                Transaction.client_id == client.id,
+                Transaction.type == "income",
+            ).all()
+        )
+        pending = global_earned - global_paid
+
+        period_total_hours += period_hours
+        period_total_earnings += period_earned
+        period_total_paid += period_paid
+        global_total_pending += pending
+        global_total_earnings += global_earned
+        global_total_paid += global_paid
+
         by_client.append({
             "client_id": client.id,
             "client_name": client.name,
             "client_color": client.color,
             "hourly_rate": client.hourly_rate,
-            "total_hours": round(client_hours, 2),
-            "total_earnings": round(client_earnings, 2),
+            "account_id": client.account_id,
+            "total_hours": round(period_hours, 2),
+            "total_earnings": round(period_earned, 2),
+            "total_paid": round(period_paid, 2),
+            "pending": round(pending, 2),
+            "global_earnings": round(global_earned, 2),
+            "global_paid": round(global_paid, 2),
         })
 
     return {
         "by_client": by_client,
-        "total_hours": round(total_hours, 2),
-        "total_earnings": round(total_earnings, 2),
+        "total_hours": round(period_total_hours, 2),
+        "total_earnings": round(period_total_earnings, 2),
+        "total_paid": round(period_total_paid, 2),
+        "total_pending": round(global_total_pending, 2),
+        "global_total_earnings": round(global_total_earnings, 2),
+        "global_total_paid": round(global_total_paid, 2),
     }
 
 
@@ -966,6 +1117,7 @@ def export_data(db: Session = Depends(get_db), _: User = Depends(get_current_use
             "name": c.name,
             "hourly_rate": c.hourly_rate,
             "color": c.color,
+            "account_id": c.account_id,
             "created_at": c.created_at.isoformat() if c.created_at else None,
         })
 
@@ -1004,6 +1156,7 @@ def export_data(db: Session = Depends(get_db), _: User = Depends(get_current_use
             "description": t.description,
             "account_id": t.account_id,
             "to_account_id": t.to_account_id,
+            "client_id": t.client_id,
             "created_at": t.created_at.isoformat() if t.created_at else None,
         })
 
@@ -1018,7 +1171,7 @@ def export_data(db: Session = Depends(get_db), _: User = Depends(get_current_use
         })
 
     return {
-        "version": 3,
+        "version": 4,
         "exported_at": datetime.utcnow().isoformat(),
         "clients": clients_data,
         "sessions": sessions_data,
@@ -1047,8 +1200,9 @@ def import_data(payload: ImportPayload, db: Session = Depends(get_db), _: User =
     db.query(Category).delete()
     db.commit()
 
-    # Map old client IDs to new ones
+    # Map old client IDs to new ones (account_id linked in a second pass)
     id_map = {}
+    pending_client_account = []  # [(new_client_id, old_account_id)]
     for c in payload.clients:
         client = Client(
             name=c["name"],
@@ -1063,6 +1217,8 @@ def import_data(payload: ImportPayload, db: Session = Depends(get_db), _: User =
         db.add(client)
         db.flush()
         id_map[c["id"]] = client.id
+        if c.get("account_id") is not None:
+            pending_client_account.append((client.id, c["account_id"]))
 
     for s in payload.sessions:
         new_client_id = id_map.get(s["client_id"])
@@ -1101,11 +1257,18 @@ def import_data(payload: ImportPayload, db: Session = Depends(get_db), _: User =
         db.flush()
         acc_map[a["id"]] = account.id
 
+    # Now that accounts have been imported and have new IDs, link clients to their default account
+    for new_client_id, old_acc_id in pending_client_account:
+        new_acc_id = acc_map.get(old_acc_id)
+        if new_acc_id is not None:
+            db.query(Client).filter(Client.id == new_client_id).update({Client.account_id: new_acc_id})
+
     for t in payload.transactions:
         new_acc_id = acc_map.get(t["account_id"])
         if new_acc_id is None:
             continue
         new_to_acc_id = acc_map.get(t.get("to_account_id")) if t.get("to_account_id") else None
+        new_client_id = id_map.get(t.get("client_id")) if t.get("client_id") else None
         tx = Transaction(
             type=t["type"],
             amount=t["amount"],
@@ -1114,6 +1277,7 @@ def import_data(payload: ImportPayload, db: Session = Depends(get_db), _: User =
             description=t.get("description", ""),
             account_id=new_acc_id,
             to_account_id=new_to_acc_id,
+            client_id=new_client_id,
         )
         if t.get("created_at"):
             try:
