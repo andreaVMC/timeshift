@@ -106,6 +106,11 @@
       <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A2 2 0 013 12V7a4 4 0 014-4z"/></svg>
       Categorie
     </button>
+    <button onclick="navigate('internal-debts')" id="nav-internal-debts"
+      class="nav-btn w-full text-left px-4 py-2.5 rounded-xl text-slate-300 hover:bg-slate-800 flex items-center gap-3 text-sm font-medium">
+      <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+      Debiti Interni
+    </button>
   </nav>
 
   <div class="px-3 py-3 border-t border-slate-700/60 space-y-1">
@@ -176,6 +181,7 @@ let sessions = [];
 let stats    = null;
 let accounts = [];
 let transactions = [];
+let internalDebts = [];
 let finStats = null;
 let calDate  = new Date();
 let view     = 'dashboard';
@@ -386,7 +392,7 @@ async function req(method, path, body=null) {
 }
 
 async function reload() {
-  [clients, sessions, stats, accounts, transactions, finStats, categoriesData] = await Promise.all([
+  [clients, sessions, stats, accounts, transactions, finStats, categoriesData, internalDebts] = await Promise.all([
     req('GET','/clients'),
     req('GET','/sessions'),
     req('GET','/stats'),
@@ -394,6 +400,7 @@ async function reload() {
     req('GET','/transactions'),
     req('GET','/finance-stats'),
     req('GET','/categories'),
+    req('GET','/internal-debts'),
   ]);
 }
 
@@ -412,6 +419,7 @@ function navigate(v) {
     case 'accounts':     renderAccounts(c);     break;
     case 'transactions': renderTransactions(c); break;
     case 'categories':   renderCategories(c);   break;
+    case 'internal-debts': renderInternalDebts(c); break;
   }
 }
 
@@ -1306,6 +1314,302 @@ function renderTransactions(el) {
       </div>`}
     </div>
   `;
+}
+
+// ─── Internal Debts view ──────────────────────────────────────────────────────
+function renderInternalDebts(el) {
+  const activeDebts = internalDebts.filter(d => !d.is_settled);
+  const settledDebts = internalDebts.filter(d => d.is_settled);
+  const totalDebt = activeDebts.reduce((a, d) => a + (d.amount - d.paid_amount), 0);
+
+  el.innerHTML = `
+    <div class="mb-7 flex items-center justify-between">
+      <div>
+        <h2 class="text-2xl font-bold text-slate-800">Debiti Interni</h2>
+        <p class="text-slate-500 mt-1 text-sm">${activeDebts.length} debit${activeDebts.length!==1?'i':'o'} attiv${activeDebts.length!==1?'i':'o'} · Totale residuo: <span class="text-amber-600 font-semibold">${euro(totalDebt)}</span></p>
+      </div>
+      <button onclick="openInternalDebtModal()" class="bg-indigo-600 text-white px-4 py-2 rounded-xl text-sm font-medium hover:bg-indigo-700 transition-colors">
+        + Nuovo Debito
+      </button>
+    </div>
+
+    ${internalDebts.length === 0 ? `
+    <div class="bg-white rounded-2xl border border-slate-100 shadow-sm p-16 text-center">
+      <div class="w-16 h-16 bg-slate-100 rounded-2xl flex items-center justify-center mx-auto mb-4 text-3xl">🤝</div>
+      <p class="text-slate-600 font-medium">Nessun debito interno</p>
+      <p class="text-slate-400 text-sm mt-1">Usa questa funzione per tracciare prestiti tra i tuoi conti</p>
+      <button onclick="openInternalDebtModal()" class="mt-5 bg-indigo-600 text-white px-5 py-2 rounded-xl text-sm font-medium hover:bg-indigo-700">+ Nuovo Debito</button>
+    </div>` : `
+    <div class="space-y-8">
+      <!-- Active Debts -->
+      <div>
+        <h3 class="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2">
+          <span class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+          Debiti Attivi
+        </h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
+          ${activeDebts.map(d => {
+            const fromAcc = accountById(d.from_account_id);
+            const toAcc = accountById(d.to_account_id);
+            const remaining = d.amount - d.paid_amount;
+            const pct = Math.round((d.paid_amount / d.amount) * 100);
+            return `
+            <div class="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden hover:shadow-md transition-shadow p-5">
+              <div class="flex items-start justify-between mb-4">
+                <div>
+                  <div class="flex items-center gap-2 mb-1">
+                    <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Dal conto</span>
+                    <span class="text-sm font-medium text-slate-700">${fromAcc?.icon} ${fromAcc?.name}</span>
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Al conto</span>
+                    <span class="text-sm font-medium text-slate-700">${toAcc?.icon} ${toAcc?.name}</span>
+                  </div>
+                </div>
+                <div class="flex gap-1">
+                  <button onclick="openInternalDebtPaybackModal(${d.id})" title="Registra rimborso"
+                    class="w-8 h-8 rounded-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100 flex items-center justify-center">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                  </button>
+                  <button onclick="confirmDeleteInternalDebt(${d.id})"
+                    class="w-8 h-8 rounded-lg hover:bg-red-50 text-slate-400 hover:text-red-500 flex items-center justify-center">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                  </button>
+                </div>
+              </div>
+              
+              <div class="mb-4">
+                <p class="text-xs text-slate-400 mb-0.5">${fmtDate(d.date)} ${d.description ? '· ' + d.description : ''}</p>
+                <div class="flex items-end justify-between">
+                  <p class="text-2xl font-bold text-slate-800">${euro(remaining)}</p>
+                  <p class="text-xs text-slate-400 mb-1">su ${euro(d.amount)}</p>
+                </div>
+              </div>
+
+              <div class="space-y-1.5">
+                <div class="flex justify-between text-[10px] font-bold text-slate-400 uppercase">
+                  <span>Rimborsato ${euro(d.paid_amount)}</span>
+                  <span>${pct}%</span>
+                </div>
+                <div class="h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                  <div class="h-full bg-indigo-500 transition-all duration-500" style="width:${pct}%"></div>
+                </div>
+              </div>
+            </div>`;
+          }).join('')}
+          ${activeDebts.length === 0 ? '<p class="text-slate-400 text-sm py-4">Nessun debito attivo</p>' : ''}
+        </div>
+      </div>
+
+      <!-- Settled Debts -->
+      ${settledDebts.length ? `
+      <div>
+        <h3 class="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2 opacity-60">
+          <span class="w-2.5 h-2.5 rounded-full bg-emerald-500"></span>
+          Debiti Saldati
+        </h3>
+        <div class="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="bg-slate-50 border-b border-slate-100">
+                <tr>
+                  <th class="text-left py-3 px-4 text-xs font-semibold text-slate-400 uppercase tracking-wide">Data</th>
+                  <th class="text-left py-3 px-4 text-xs font-semibold text-slate-400 uppercase tracking-wide">Da → A</th>
+                  <th class="text-left py-3 px-4 text-xs font-semibold text-slate-400 uppercase tracking-wide">Descrizione</th>
+                  <th class="text-right py-3 px-4 text-xs font-semibold text-slate-400 uppercase tracking-wide">Importo</th>
+                  <th class="py-3 px-4"></th>
+                </tr>
+              </thead>
+              <tbody>
+                ${settledDebts.map(d => {
+                  const fromAcc = accountById(d.from_account_id);
+                  const toAcc = accountById(d.to_account_id);
+                  return `
+                  <tr class="border-b border-slate-50 text-slate-400 italic">
+                    <td class="py-3 px-4">${fmtDate(d.date)}</td>
+                    <td class="py-3 px-4">${fromAcc?.name} → ${toAcc?.name}</td>
+                    <td class="py-3 px-4 truncate max-w-xs">${d.description || '—'}</td>
+                    <td class="py-3 px-4 text-right">${euro(d.amount)}</td>
+                    <td class="py-3 px-4 text-right">
+                      <button onclick="confirmDeleteInternalDebt(${d.id})"
+                        class="w-7 h-7 rounded-lg hover:bg-red-50 flex items-center justify-center text-slate-300 hover:text-red-500">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                      </button>
+                    </td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>` : ''}
+    </div>`}
+  `;
+}
+
+function openInternalDebtModal() {
+  const today = new Date().toISOString().slice(0,10);
+  document.getElementById('modal-body').innerHTML = `
+    <div class="p-6">
+      <div class="flex items-center justify-between mb-6">
+        <h3 class="text-base font-semibold text-slate-800">Nuovo Debito Interno</h3>
+        <button onclick="closeModal()" class="w-8 h-8 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-400">✕</button>
+      </div>
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Conto che PRESTA (Sorgente) *</label>
+          <select id="id-from-account" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm">
+            <option value="">Seleziona conto…</option>
+            ${accounts.map(a => `<option value="${a.id}">${a.icon} ${a.name}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Conto che RICEVE (Destinazione) *</label>
+          <select id="id-to-account" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm">
+            <option value="">Seleziona conto…</option>
+            ${accounts.map(a => `<option value="${a.id}">${a.icon} ${a.name}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Importo *</label>
+          <div class="relative">
+            <input id="id-amount" type="number" min="0.01" step="0.01" placeholder="0.00"
+              class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm pr-10" />
+            <span class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm font-medium">€</span>
+          </div>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Data *</label>
+          <input id="id-date" type="date" value="${today}"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Descrizione</label>
+          <input id="id-desc" type="text" placeholder="es. Prestito per affitto"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm" />
+        </div>
+      </div>
+
+      <div class="bg-indigo-50 rounded-xl p-4 mt-6">
+        <p class="text-xs text-indigo-700 leading-relaxed">
+          <strong>Nota:</strong> Verrà creato automaticamente un movimento di <strong>trasferimento</strong> tra i due conti per la data indicata.
+        </p>
+      </div>
+
+      <div class="flex gap-3 mt-6">
+        <button onclick="closeModal()" class="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-sm font-medium">Annulla</button>
+        <button onclick="saveInternalDebt()" class="flex-1 py-2.5 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 text-sm font-medium">Crea Debito</button>
+      </div>
+    </div>
+  `;
+  showModal();
+}
+
+async function saveInternalDebt() {
+  const fromAccId = parseInt(document.getElementById('id-from-account').value);
+  const toAccId   = parseInt(document.getElementById('id-to-account').value);
+  const amount    = parseFloat(document.getElementById('id-amount').value);
+  const date      = document.getElementById('id-date').value;
+  const description = document.getElementById('id-desc').value.trim();
+
+  if (!fromAccId || !toAccId) return toast('Seleziona entrambi i conti', true);
+  if (fromAccId === toAccId)   return toast('I conti devono essere diversi', true);
+  if (!amount || amount <= 0)  return toast('Inserisci un importo valido', true);
+  if (!date)                   return toast('Seleziona una data', true);
+
+  try {
+    await req('POST', '/internal-debts', { from_account_id: fromAccId, to_account_id: toAccId, amount, date, description });
+    toast('Debito interno creato!');
+    closeModal();
+    await reload();
+    navigate(view);
+  } catch(e) { toast(e.message, true); }
+}
+
+function openInternalDebtPaybackModal(debtId) {
+  const d = internalDebts.find(x => x.id === debtId);
+  if (!d) return;
+  const fromAcc = accountById(d.from_account_id);
+  const toAcc   = accountById(d.to_account_id);
+  const remaining = d.amount - d.paid_amount;
+  const today = new Date().toISOString().slice(0,10);
+
+  document.getElementById('modal-body').innerHTML = `
+    <div class="p-6">
+      <div class="flex items-center justify-between mb-6">
+        <h3 class="text-base font-semibold text-slate-800">Registra Rimborso</h3>
+        <button onclick="closeModal()" class="w-8 h-8 rounded-lg hover:bg-slate-100 flex items-center justify-center text-slate-400">✕</button>
+      </div>
+
+      <div class="bg-slate-50 rounded-xl p-4 mb-4">
+        <div class="flex justify-between text-xs text-slate-400 mb-1">
+          <span>Debito Residuo</span>
+          <span>Sorgente: ${toAcc?.name}</span>
+        </div>
+        <p class="text-xl font-bold text-emerald-600">${euro(remaining)}</p>
+      </div>
+
+      <div class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Importo Rimborso *</label>
+          <div class="relative">
+            <input id="pb-amount" type="number" min="0.01" max="${remaining}" step="0.01" value="${remaining.toFixed(2)}"
+              class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm pr-10" />
+            <span class="absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm font-medium">€</span>
+          </div>
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Data</label>
+          <input id="pb-date" type="date" value="${today}"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm" />
+        </div>
+        <div>
+          <label class="block text-sm font-medium text-slate-700 mb-1.5">Descrizione</label>
+          <input id="pb-desc" type="text" placeholder="Rimborso debito interno"
+            class="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-800 text-sm" />
+        </div>
+      </div>
+
+      <div class="bg-emerald-50 rounded-xl p-4 mt-6">
+        <p class="text-xs text-emerald-700 leading-relaxed">
+          <strong>Nota:</strong> Verrà creato un movimento di <strong>trasferimento</strong> da ${toAcc?.name} a ${fromAcc?.name}.
+        </p>
+      </div>
+
+      <div class="flex gap-3 mt-6">
+        <button onclick="closeModal()" class="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-sm font-medium">Annulla</button>
+        <button onclick="saveInternalDebtPayback(${debtId})" class="flex-1 py-2.5 rounded-xl bg-emerald-600 text-white hover:bg-emerald-700 text-sm font-medium">Registra Rimborso</button>
+      </div>
+    </div>
+  `;
+  showModal();
+}
+
+async function saveInternalDebtPayback(debtId) {
+  const amount = parseFloat(document.getElementById('pb-amount').value);
+  const date   = document.getElementById('pb-date').value;
+  const desc   = document.getElementById('pb-desc').value.trim();
+
+  if (!amount || amount <= 0) return toast('Inserisci un importo valido', true);
+
+  try {
+    await req('POST', `/internal-debts/${debtId}/payback`, { amount, date, description: desc });
+    toast('Rimborso registrato!');
+    closeModal();
+    await reload();
+    navigate(view);
+  } catch(e) { toast(e.message, true); }
+}
+
+async function confirmDeleteInternalDebt(id) {
+  if (!confirm('Eliminare questo record di debito?\n(I movimenti di trasferimento già creati NON verranno eliminati)')) return;
+  try {
+    await req('DELETE', `/internal-debts/${id}`);
+    toast('Record eliminato');
+    await reload();
+    navigate(view);
+  } catch(e) { toast(e.message, true); }
 }
 
 // ─── Client modal ─────────────────────────────────────────────────────────────

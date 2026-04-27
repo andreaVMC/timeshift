@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import bcrypt as _bcrypt
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text, ForeignKey, Boolean
 
 
 def hash_password(password: str) -> str:
@@ -89,6 +89,23 @@ class Transaction(Base):
     client = relationship("Client", foreign_keys=[client_id])
 
 
+class InternalDebt(Base):
+    __tablename__ = "internal_debts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    from_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    description = Column(Text, default="")
+    paid_amount = Column(Float, default=0.0)
+    is_settled = Column(Boolean, default=False)
+    date = Column(String, nullable=False)            # YYYY-MM-DD
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    from_account = relationship("Account", foreign_keys=[from_account_id])
+    to_account = relationship("Account", foreign_keys=[to_account_id])
+
+
 class Category(Base):
     __tablename__ = "categories"
 
@@ -132,6 +149,9 @@ def _migrate():
         tx_cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(transactions)").fetchall()]
         if "client_id" not in tx_cols:
             conn.exec_driver_sql("ALTER TABLE transactions ADD COLUMN client_id INTEGER REFERENCES clients(id)")
+        
+        # Check if internal_debts table exists (Base.metadata.create_all should handle it, but for safety in dev)
+        # We also use this block to add columns to existing tables if needed in the future.
         conn.commit()
 
 _migrate()
@@ -462,6 +482,48 @@ class TransactionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Internal Debt schemas ───────────────────────────────────────────────────
+
+class InternalDebtCreate(BaseModel):
+    from_account_id: int
+    to_account_id: int
+    amount: float
+    description: str = ""
+    date: str
+
+
+class InternalDebtUpdate(BaseModel):
+    from_account_id: Optional[int] = None
+    to_account_id: Optional[int] = None
+    amount: Optional[float] = None
+    description: Optional[str] = None
+    paid_amount: Optional[float] = None
+    is_settled: Optional[bool] = None
+    date: Optional[str] = None
+
+
+class InternalDebtOut(BaseModel):
+    id: int
+    from_account_id: int
+    to_account_id: int
+    amount: float
+    description: str
+    paid_amount: float
+    is_settled: bool
+    date: str
+    from_account: AccountOut
+    to_account: AccountOut
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class InternalDebtPaybackRequest(BaseModel):
+    amount: float
+    date: Optional[str] = None
+    description: Optional[str] = None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _compute_hours(start: str, end: str) -> float:
@@ -697,6 +759,87 @@ def delete_transaction(tx_id: int, db: Session = Depends(get_db), _: User = Depe
     if not tx:
         raise HTTPException(status_code=404, detail="Movimento non trovato")
     db.delete(tx)
+    db.commit()
+
+
+# ── Internal Debt endpoints ─────────────────────────────────────────────────
+
+@app.get("/internal-debts", response_model=List[InternalDebtOut])
+def list_internal_debts(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    return db.query(InternalDebt).order_by(InternalDebt.date.desc(), InternalDebt.id.desc()).all()
+
+
+@app.post("/internal-debts", response_model=InternalDebtOut, status_code=201)
+def create_internal_debt(data: InternalDebtCreate, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    if data.from_account_id == data.to_account_id:
+        raise HTTPException(status_code=422, detail="I conti devono essere diversi")
+    
+    # Create the internal debt record
+    debt = InternalDebt(**data.model_dump())
+    db.add(debt)
+    
+    # Automatically create the transfer transaction
+    tx = Transaction(
+        type="transfer",
+        amount=data.amount,
+        date=data.date,
+        description=f"Debito Interno: {data.description}" if data.description else "Debito Interno",
+        account_id=data.from_account_id,
+        to_account_id=data.to_account_id,
+        category="Debito Interno"
+    )
+    db.add(tx)
+    
+    db.commit()
+    db.refresh(debt)
+    return debt
+
+
+@app.post("/internal-debts/{debt_id}/payback", response_model=InternalDebtOut)
+def record_payback(
+    debt_id: int,
+    data: InternalDebtPaybackRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    debt = db.query(InternalDebt).filter(InternalDebt.id == debt_id).first()
+    if not debt:
+        raise HTTPException(status_code=404, detail="Debito non trovato")
+    if debt.is_settled:
+        raise HTTPException(status_code=422, detail="Questo debito è già stato saldato")
+
+    remaining = debt.amount - debt.paid_amount
+    if data.amount > remaining + 0.005:
+        raise HTTPException(status_code=422, detail=f"L'importo inserito ({data.amount}) è superiore al debito residuo ({remaining})")
+
+    # Update debt
+    debt.paid_amount += data.amount
+    if abs(debt.amount - debt.paid_amount) < 0.005:
+        debt.is_settled = True
+
+    # Create payback transfer (from Borrower to Lender)
+    tx = Transaction(
+        type="transfer",
+        amount=data.amount,
+        date=data.date or datetime.utcnow().strftime("%Y-%m-%d"),
+        description=data.description or f"Rimborso Debito Interno #{debt.id}",
+        account_id=debt.to_account_id, # Borrower pays
+        to_account_id=debt.from_account_id, # Lender receives
+        category="Rimborso Debito"
+    )
+    db.add(tx)
+    
+    db.commit()
+    db.refresh(debt)
+    return debt
+
+
+@app.delete("/internal-debts/{debt_id}", status_code=204)
+def delete_internal_debt(debt_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    debt = db.query(InternalDebt).filter(InternalDebt.id == debt_id).first()
+    if not debt:
+        raise HTTPException(status_code=404, detail="Debito non trovato")
+    db.delete(debt)
     db.commit()
 
 
@@ -1170,14 +1313,29 @@ def export_data(db: Session = Depends(get_db), _: User = Depends(get_current_use
             "created_at": cat.created_at.isoformat() if cat.created_at else None,
         })
 
+    internal_debts_data = []
+    for d in db.query(InternalDebt).order_by(InternalDebt.id).all():
+        internal_debts_data.append({
+            "id": d.id,
+            "from_account_id": d.from_account_id,
+            "to_account_id": d.to_account_id,
+            "amount": d.amount,
+            "description": d.description,
+            "paid_amount": d.paid_amount,
+            "is_settled": d.is_settled,
+            "date": d.date,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+        })
+
     return {
-        "version": 4,
+        "version": 5,
         "exported_at": datetime.utcnow().isoformat(),
         "clients": clients_data,
         "sessions": sessions_data,
         "accounts": accounts_data,
         "transactions": transactions_data,
         "categories": categories_data,
+        "internal_debts": internal_debts_data,
     }
 
 
@@ -1188,11 +1346,13 @@ class ImportPayload(BaseModel):
     accounts: List[dict] = []
     transactions: List[dict] = []
     categories: List[dict] = []
+    internal_debts: List[dict] = []
 
 
 @app.post("/import")
 def import_data(payload: ImportPayload, db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     # Clear existing data (children first due to FK)
+    db.query(InternalDebt).delete()
     db.query(Transaction).delete()
     db.query(Account).delete()
     db.query(WorkSession).delete()
@@ -1285,6 +1445,27 @@ def import_data(payload: ImportPayload, db: Session = Depends(get_db), _: User =
             except (ValueError, TypeError):
                 pass
         db.add(tx)
+
+    for d in payload.internal_debts:
+        new_from_acc_id = acc_map.get(d["from_account_id"])
+        new_to_acc_id = acc_map.get(d["to_account_id"])
+        if new_from_acc_id is None or new_to_acc_id is None:
+            continue
+        debt = InternalDebt(
+            from_account_id=new_from_acc_id,
+            to_account_id=new_to_acc_id,
+            amount=d["amount"],
+            description=d.get("description", ""),
+            paid_amount=d.get("paid_amount", 0.0),
+            is_settled=d.get("is_settled", False),
+            date=d["date"],
+        )
+        if d.get("created_at"):
+            try:
+                debt.created_at = datetime.fromisoformat(d["created_at"])
+            except (ValueError, TypeError):
+                pass
+        db.add(debt)
 
     # Import categories (or re-seed defaults if none provided)
     imported_cats = 0

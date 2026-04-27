@@ -16,3 +16,4 @@ Web app per la gestione di ore lavorate e movimenti economici per cliente.
 - [x] **Clienti a 0€/ora** — Permettere la creazione di clienti con tariffa oraria a 0€ (attività non retribuite / pro bono)
 - [x] **Collegamento attività lavorative ↔ movimenti** — Collegare le attività lavorative ai movimenti economici corrispondenti
 - [x] **Crediti pendenti per cliente** — Collegare un cliente a un conto predefinito; la dashboard mostra quanto guadagnato vs. quanto incassato per ciascun cliente, con bottone "Registra Pagamento" e filtro per includere/escludere i crediti pendenti dal totale
+- [] **Non e' possibile eliminare le attivita' una volta inserite, solo modificarle (need to be fixed)**
